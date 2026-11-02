@@ -1,0 +1,28 @@
+name: "Set up Docker"
+description: >-
+  Set up QEMU + Docker Buildx and authenticate to Docker Hub for multi-arch
+  image builds. Centralizes the QEMU/Buildx/login trio used by release,
+  preview, and stable workflows.
+
+inputs:
+  enable-qemu:
+    description: "Set up QEMU for multi-platform builds"
+    required: false
+    default: "true"
+  dockerhub-username:
+    description: "Docker Hub username (pass from secrets)"
+    required: true
+  dockerhub-token:
+    description: "Docker Hub token/password (pass from secrets)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      if: inputs.enable-qemu == 'true'
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      with:
+        username: ${{ inputs.dockerhub-username }}
+        password: ${{ inputs.dockerhub-token }}

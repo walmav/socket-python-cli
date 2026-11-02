@@ -8,6 +8,8 @@ from git import Optional
 from socketsecurity import USER_AGENT
 from socketsecurity.core import log
 from socketsecurity.core.classes import Comment
+from socketsecurity.core.exceptions import APIFailure
+from socketsecurity.core.git_remote import parse_git_remote
 from socketsecurity.core.scm_comments import Comments
 from socketsecurity.socketcli import CliClient
 
@@ -34,6 +36,19 @@ class GithubConfig:
     event_action: Optional[str]
     headers: dict
 
+    @staticmethod
+    def _repository_from_buildkite() -> tuple[str, str]:
+        """Return ``(owner, repository)`` from Buildkite's Git repository URL."""
+        # Comments and statuses belong to the pipeline/base repository, not a
+        # contributor's fork from BUILDKITE_PULL_REQUEST_REPO.
+        _, repository_path = parse_git_remote(
+            os.getenv("BUILDKITE_REPO") or os.getenv("BUILDKITE_PULL_REQUEST_REPO")
+        )
+        parts = repository_path.split("/") if repository_path else []
+        if len(parts) < 2:
+            return "", ""
+        return parts[-2], parts[-1]
+
     @classmethod
     def from_env(cls, pr_number: Optional[str] = None) -> 'GithubConfig':
         """Create config from environment variables with optional overrides"""
@@ -42,12 +57,24 @@ class GithubConfig:
             log.error("Unable to get Github API Token from GH_API_TOKEN")
             sys.exit(2)
         
-        # Use provided PR number if available, otherwise fall back to env var
+        is_buildkite = os.getenv("BUILDKITE") == "true"
+        buildkite_pr = os.getenv("BUILDKITE_PULL_REQUEST")
+        is_buildkite_pr = bool(
+            is_buildkite
+            and buildkite_pr
+            and buildkite_pr.casefold() != "false"
+        )
+
+        # Use explicit/GitHub-compatible values first, then native Buildkite PR context.
         pr_number = pr_number or os.getenv('PR_NUMBER')
+        if not pr_number and is_buildkite_pr:
+            pr_number = buildkite_pr
         
         # Add debug logging
-        sha = os.getenv('GITHUB_SHA', '')
-        log.debug(f"Loading SHA from GITHUB_SHA: {sha}")
+        sha = os.getenv('GITHUB_SHA') or (
+            os.getenv("BUILDKITE_COMMIT", "") if is_buildkite else ""
+        )
+        log.debug(f"Loading GitHub integration SHA: {sha}")
         event_action = os.getenv('EVENT_ACTION', None)
         if not event_action:
             event_path = os.getenv('GITHUB_EVENT_PATH')
@@ -55,29 +82,66 @@ class GithubConfig:
                 with open(event_path, 'r') as f:
                     event = json.load(f)
                     event_action = event.get('action')
+        if not event_action and is_buildkite_pr:
+            # Buildkite provides the current PR state, not the originating
+            # GitHub webhook action. A running PR build is equivalent to the
+            # supported synchronize path for comment updates.
+            event_action = "synchronize"
         repository = os.getenv('GITHUB_REPOSITORY', '')
         owner = os.getenv('GITHUB_REPOSITORY_OWNER', '')
         if '/' in repository:
             owner = repository.split('/')[0]
             repository = repository.split('/')[1]
+        elif is_buildkite:
+            buildkite_owner, buildkite_repository = cls._repository_from_buildkite()
+            owner = owner or buildkite_owner
+            repository = repository or buildkite_repository
 
         default_branch_env = os.getenv('DEFAULT_BRANCH')
         # Consider the variable truthy if it exists and isn't explicitly 'false'
-        is_default = default_branch_env is not None and default_branch_env.lower() != 'false'
+        if default_branch_env is not None:
+            is_default = default_branch_env.lower() != 'false'
+        elif is_buildkite:
+            # Require a branch name: comparing two unset variables would otherwise report
+            # every build as the default branch and overwrite the repository's baseline.
+            buildkite_branch = os.getenv("BUILDKITE_BRANCH")
+            is_default = bool(
+                not is_buildkite_pr
+                and buildkite_branch
+                and buildkite_branch == os.getenv("BUILDKITE_PIPELINE_DEFAULT_BRANCH")
+            )
+        else:
+            is_default = False
+
+        event_name = os.getenv('GITHUB_EVENT_NAME', '')
+        if not event_name and is_buildkite:
+            event_name = "pull_request" if is_buildkite_pr else "push"
         return cls(
-            sha=os.getenv('GITHUB_SHA', ''),
-            api_url=os.getenv('GITHUB_API_URL', ''),
-            ref_type=os.getenv('GITHUB_REF_TYPE', ''),
-            event_name=os.getenv('GITHUB_EVENT_NAME', ''),
-            workspace=os.getenv('GITHUB_WORKSPACE', ''),
+            sha=sha,
+            api_url=os.getenv('GITHUB_API_URL') or (
+                "https://api.github.com" if is_buildkite else ""
+            ),
+            ref_type=os.getenv('GITHUB_REF_TYPE') or (
+                "branch" if is_buildkite else ""
+            ),
+            event_name=event_name,
+            workspace=os.getenv('GITHUB_WORKSPACE') or (
+                os.getenv("BUILDKITE_BUILD_CHECKOUT_PATH", "") if is_buildkite else ""
+            ),
             repository=repository,
-            ref_name=os.getenv('GITHUB_REF_NAME', ''),
+            ref_name=os.getenv('GITHUB_REF_NAME') or (
+                os.getenv("BUILDKITE_BRANCH", "") if is_buildkite else ""
+            ),
             default_branch=is_default,
             is_default_branch=is_default,
             pr_number=pr_number,
             pr_name=os.getenv('PR_NAME'),
-            commit_message=os.getenv('COMMIT_MESSAGE'),
-            actor=os.getenv('GITHUB_ACTOR', ''),
+            commit_message=os.getenv('COMMIT_MESSAGE') or (
+                os.getenv("BUILDKITE_MESSAGE") if is_buildkite else None
+            ),
+            actor=os.getenv('GITHUB_ACTOR') or (
+                os.getenv("BUILDKITE_BUILD_CREATOR", "") if is_buildkite else ""
+            ),
             env=os.getenv('GITHUB_ENV', ''),
             token=token,
             owner=owner,
@@ -91,9 +155,21 @@ class GithubConfig:
 
 
 class Github:
-    def __init__(self, client: CliClient, config: Optional[GithubConfig] = None):
+    WRITE_PERMISSIONS = frozenset({"write", "maintain", "admin"})
+
+    def __init__(
+        self,
+        client: CliClient,
+        config: Optional[GithubConfig] = None,
+        ignore_authorization: str = "enforce",
+    ):
         self.config = config or GithubConfig.from_env()
         self.client = client
+        self.ignore_authorization = ignore_authorization
+        # Permission is stable for the duration of one CLI run. Cache both
+        # positive and negative answers so several ignore comments by the same
+        # author do not each make an API request.
+        self._ignore_permission_cache: dict[str, Optional[bool]] = {}
 
         if not self.config.token:
             log.error("Unable to get Github API Token")
@@ -161,7 +237,76 @@ class Github:
         else:
             log.error(raw_comments)
 
-        return Comments.check_for_socket_comments(comments)
+        gate = None if self.ignore_authorization == "off" else self.is_ignore_authorized
+        return Comments.check_for_socket_comments(comments, gate)
+
+    def is_ignore_authorized(self, comment: Comment) -> bool:
+        """Whether a commenter may suppress alerts with @SocketSecurity ignore.
+
+        ``author_association`` describes a social relationship to the repository,
+        not the author's role: an organization member or outside collaborator can
+        still have read-only access. Ask GitHub for the effective repository
+        permission instead, and cache the answer for subsequent comments.
+        """
+        author = Comments.comment_author_name(comment)
+        if author == "an unknown user":
+            permission = None
+        elif author in self._ignore_permission_cache:
+            permission = self._ignore_permission_cache[author]
+        else:
+            path = (
+                f"repos/{self.config.owner}/{self.config.repository}/"
+                f"collaborators/{author}/permission"
+            )
+            try:
+                response = self.client.request(
+                    path=path,
+                    headers=self.config.headers,
+                    base_url=self.config.api_url,
+                )
+                result = response.json()
+                if not isinstance(result, dict) or not isinstance(
+                    result.get("permission"), str
+                ):
+                    log.warning("Unexpected GitHub repository permission response")
+                    permission = None
+                else:
+                    permission = (
+                        result["permission"].casefold() in self.WRITE_PERMISSIONS
+                    )
+            except APIFailure as error:
+                if getattr(error, "status_code", None) == 404:
+                    # The repository was readable when its comments were listed,
+                    # so a missing collaborator permission is a definitive denial.
+                    permission = False
+                else:
+                    log.warning(
+                        "Could not read GitHub repository permission for "
+                        f"{author}: {error}"
+                    )
+                    permission = None
+            except Exception as error:
+                log.warning(
+                    f"Could not read GitHub repository permission for {author}: {error}"
+                )
+                permission = None
+            self._ignore_permission_cache[author] = permission
+
+        if permission is not None:
+            return permission
+        if self.ignore_authorization == "strict":
+            log.warning(
+                f"Rejecting @SocketSecurity ignore from {author}: GitHub repository "
+                "permission could not be read and --ignore-authorization is strict."
+            )
+            return False
+        log.warning(
+            f"Honoring @SocketSecurity ignore from {author} without verifying write "
+            "access: GitHub repository permission could not be read. Use a token "
+            "with repository metadata access, or --ignore-authorization strict to "
+            "reject instead."
+        )
+        return True
 
     def add_socket_comments(
         self,

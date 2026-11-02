@@ -3,8 +3,10 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
+
 from mdutils import MdUtils
 from prettytable import PrettyTable
 
@@ -13,6 +15,13 @@ from socketsecurity.core.classes import Diff, Issue, Purl
 log = logging.getLogger("socketcli")
 
 class Messages:
+
+    @staticmethod
+    def get_patched_version(alert: Issue) -> str:
+        """Return the first patched version exposed by an alert, if any."""
+        props = getattr(alert, "props", {}) or {}
+        value = props.get("firstPatchedVersionIdentifier")
+        return str(value) if value not in (None, "") else ""
 
     @staticmethod
     def map_severity_to_sarif(severity: str) -> str:
@@ -370,6 +379,210 @@ class Messages:
         return sarif_data
 
     @staticmethod
+    def _normalize_reachability(reachability: str) -> str:
+        return str(reachability or "unknown").strip().lower().replace("-", "_").replace(" ", "_")
+
+    @staticmethod
+    def _matches_reachability_filter(reachability: str, selector: str, undeterminable: bool = False) -> bool:
+        normalized = Messages._normalize_reachability(reachability)
+        selected = (selector or "all").strip().lower()
+
+        if selected == "all":
+            return True
+        if selected == "reachable":
+            return normalized == "reachable"
+
+        potential_states = {"unknown", "error", "maybe_reachable", "potentially_reachable"}
+        is_potential = normalized in potential_states or undeterminable
+
+        if selected == "potentially":
+            return is_potential
+        if selected == "reachable-or-potentially":
+            return normalized == "reachable" or is_potential
+
+        return True
+
+    @staticmethod
+    def create_security_comment_sarif_from_facts(
+        components_with_alerts: list,
+        reachability_filter: str = "all",
+        grouping: str = "instance",
+    ) -> dict:
+        """
+        Create SARIF output directly from reachability facts-derived alerts.
+
+        Args:
+            components_with_alerts: Components from convert_to_alerts(...)
+            reachability_filter: all|reachable|potentially|reachable-or-potentially
+            grouping: instance|alert
+        """
+        sarif_data = {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "Socket Security",
+                        "informationUri": "https://socket.dev",
+                        "rules": []
+                    }
+                },
+                "results": []
+            }]
+        }
+
+        rules_map = {}
+        results_list = []
+        grouped_results = {}
+
+        for component in components_with_alerts or []:
+            comp_type = component.get("type", "unknown")
+            comp_name = component.get("name") or component.get("id") or "unknown-package"
+            comp_version = component.get("version") or "unknown-version"
+
+            fallback_uri = f"pkg:{comp_type}/{comp_name}@{comp_version}"
+            manifests = component.get("manifestFiles", [])
+            manifest_uris = []
+            if isinstance(manifests, list):
+                for mf in manifests:
+                    if isinstance(mf, dict):
+                        path = mf.get("path") or mf.get("file") or mf.get("name")
+                        if path:
+                            manifest_uris.append(str(path))
+                    elif isinstance(mf, str):
+                        manifest_uris.append(mf)
+
+            if not manifest_uris:
+                manifest_uris = [fallback_uri]
+            else:
+                # Preserve order while removing duplicate manifest entries.
+                manifest_uris = list(dict.fromkeys(manifest_uris))
+
+            for alert in component.get("alerts", []):
+                props = alert.get("props", {}) or {}
+                reachability = Messages._normalize_reachability(props.get("reachability", "unknown"))
+                undeterminable = bool(props.get("undeterminableReachability", False))
+                if not Messages._matches_reachability_filter(
+                    reachability=reachability,
+                    selector=reachability_filter,
+                    undeterminable=undeterminable,
+                ):
+                    continue
+
+                vuln_id = props.get("ghsaId") or props.get("cveId") or alert.get("title") or "unknown-vulnerability"
+                severity = str(alert.get("severity", "low")).lower()
+                if grouping == "alert":
+                    rule_id = f"{comp_name}:{vuln_id}"
+                    rule_name = f"Reachability alert {vuln_id} in {comp_name}"
+                else:
+                    rule_id = f"{comp_name}=={comp_version}:{vuln_id}"
+                    rule_name = f"Reachability alert {vuln_id} in {comp_name}@{comp_version}"
+                socket_url = (
+                    props.get("url")
+                    or Messages.get_manifest_type_url(manifest_uris[0], comp_name, comp_version)
+                )
+
+                if rule_id not in rules_map:
+                    rules_map[rule_id] = {
+                        "id": rule_id,
+                        "name": rule_name,
+                        "shortDescription": {"text": rule_name},
+                        "fullDescription": {"text": alert.get("title", rule_name)},
+                        "helpUri": socket_url,
+                        "defaultConfiguration": {
+                            "level": Messages.map_severity_to_sarif(severity)
+                        },
+                    }
+
+                message = (
+                    f"Reachability: {reachability}. "
+                    f"Suggested Action:<br/>{props.get('range', '')}"
+                    f"<br/><a href=\"{socket_url}\">{socket_url}</a>"
+                )
+
+                if grouping == "alert":
+                    alert_key = props.get("key") or props.get("alertKey") or f"{comp_type}:{comp_name}:{vuln_id}"
+                    existing = grouped_results.get(alert_key)
+                    if not existing:
+                        first_uri = manifest_uris[0]
+                        grouped_results[alert_key] = {
+                            "ruleId": rule_id,
+                            "message": {"text": message},
+                            "locations": [{
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": first_uri},
+                                    "region": {
+                                        "startLine": 1,
+                                        "snippet": {"text": f"{comp_name}@{comp_version}"}
+                                    },
+                                }
+                            }],
+                            "properties": {
+                                "reachability": reachability,
+                                "reachabilityStates": [reachability],
+                                "versions": [str(comp_version)],
+                                "manifestUris": list(manifest_uris),
+                                "purls": [props.get("purl")] if props.get("purl") else [],
+                                "ghsaId": props.get("ghsaId"),
+                                "cveId": props.get("cveId"),
+                                "source": "socket-facts",
+                                "socketAlertKey": alert_key,
+                            }
+                        }
+                    else:
+                        states = set(existing["properties"].get("reachabilityStates", []))
+                        states.add(reachability)
+                        existing["properties"]["reachabilityStates"] = sorted(states)
+
+                        versions = set(existing["properties"].get("versions", []))
+                        versions.add(str(comp_version))
+                        existing["properties"]["versions"] = sorted(versions)
+
+                        uris = set(existing["properties"].get("manifestUris", []))
+                        uris.update(manifest_uris)
+                        existing["properties"]["manifestUris"] = sorted(uris)
+
+                        purls = set(existing["properties"].get("purls", []))
+                        if props.get("purl"):
+                            purls.add(props.get("purl"))
+                        existing["properties"]["purls"] = sorted(purls)
+                else:
+                    for uri in manifest_uris:
+                        results_list.append({
+                            "ruleId": rule_id,
+                            "message": {"text": message},
+                            "locations": [{
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": uri},
+                                    "region": {
+                                        "startLine": 1,
+                                        "snippet": {"text": f"{comp_name}@{comp_version}"}
+                                    },
+                                }
+                            }],
+                            "properties": {
+                                "reachability": reachability,
+                                "purl": props.get("purl"),
+                                "ghsaId": props.get("ghsaId"),
+                                "cveId": props.get("cveId"),
+                                "source": "socket-facts"
+                            }
+                        })
+
+        if grouping == "alert":
+            for grouped in grouped_results.values():
+                states = grouped["properties"].get("reachabilityStates", [])
+                if "reachable" in states:
+                    grouped["properties"]["reachability"] = "reachable"
+                elif states:
+                    grouped["properties"]["reachability"] = states[0]
+                results_list.append(grouped)
+
+        sarif_data["runs"][0]["tool"]["driver"]["rules"] = list(rules_map.values())
+        sarif_data["runs"][0]["results"] = results_list
+        return sarif_data
+
+    @staticmethod
     def create_security_comment_json(diff: Diff) -> dict:
         scan_failed = False
         if len(diff.new_alerts) > 0:
@@ -388,6 +601,20 @@ class Messages:
             alert: Issue
             output["new_alerts"].append(json.loads(str(alert)))
         return output
+
+    @staticmethod
+    def _pkg_type_to_package_manager(pkg_type: str) -> str:
+        """Map Socket pkg_type to GitLab package_manager name for dependency_files."""
+        mapping = {
+            "npm": "npm",
+            "pypi": "pip",
+            "go": "go",
+            "maven": "maven",
+            "gem": "bundler",
+            "nuget": "nuget",
+            "cargo": "cargo",
+        }
+        return mapping.get(pkg_type, pkg_type or "unknown")
 
     @staticmethod
     def map_socket_severity_to_gitlab(severity: str) -> str:
@@ -429,32 +656,48 @@ class Messages:
         """
         identifiers = []
 
-        # Primary identifier: Socket alert type
-        identifiers.append({
+        # Primary identifier: Socket alert type. The GitLab schema types identifier
+        # url as a string matching ^(https?|ftp)://, so an absent url is omitted
+        # rather than sent as null, which fails validation for the whole finding.
+        socket_identifier = {
             "type": "socket_alert",
             "name": f"Socket {alert.type}",
             "value": alert.type,
-            "url": alert.url if hasattr(alert, 'url') and alert.url else None
-        })
+        }
+        alert_url = getattr(alert, "url", None)
+        if alert_url:
+            socket_identifier["url"] = alert_url
+        identifiers.append(socket_identifier)
 
-        # Extract CVE identifiers from props
-        if hasattr(alert, 'props') and alert.props:
-            if 'cve' in alert.props:
-                cves = alert.props['cve']
-                if isinstance(cves, list):
-                    for cve in cves:
-                        identifiers.append({
-                            "type": "cve",
-                            "name": cve,
-                            "value": cve,
-                            "url": f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={cve}"
-                        })
-                elif isinstance(cves, str):
+        props = getattr(alert, "props", None) or {}
+        # Alerts reach Issue.props from several sources, so both spellings of each
+        # field are in play; core.alert_selection matches on the same pair. "cve" is
+        # the older spelling and still appears in some payloads.
+        identifier_fields = (
+            (("cveId", "cve_id", "cve"), "cve", "https://nvd.nist.gov/vuln/detail/"),
+            (("ghsaId", "ghsa_id"), "ghsa", "https://github.com/advisories/"),
+        )
+        seen = set()
+        for fields, identifier_type, url_prefix in identifier_fields:
+            for field in fields:
+                values = props.get(field)
+                if isinstance(values, str):
+                    values = [values]
+                elif not isinstance(values, (list, tuple)):
+                    continue
+                for value in values:
+                    if not isinstance(value, str) or not value.strip():
+                        continue
+                    value = value.strip()
+                    identifier_key = (identifier_type, value.upper())
+                    if identifier_key in seen:
+                        continue
+                    seen.add(identifier_key)
                     identifiers.append({
-                        "type": "cve",
-                        "name": cves,
-                        "value": cves,
-                        "url": f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={cves}"
+                        "type": identifier_type,
+                        "name": value,
+                        "value": value,
+                        "url": f"{url_prefix}{value}"
                     })
 
         return identifiers
@@ -467,37 +710,35 @@ class Messages:
         GitLab location requires:
         - file: path to manifest file
         - dependency: package name and version
-        - dependency_path (optional): dependency chain
         """
-        # Get manifest file from introduced_by or manifests attribute
-        manifest_file = "unknown"
-        dependency_path = []
-        is_direct = True
+        manifest_file = ""
 
-        if hasattr(alert, 'introduced_by') and alert.introduced_by:
-            if isinstance(alert.introduced_by, list) and len(alert.introduced_by) > 0:
-                first_entry = alert.introduced_by[0]
-                if isinstance(first_entry, (list, tuple)) and len(first_entry) >= 2:
-                    dependency_path_str = first_entry[0]
-                    manifest_file = first_entry[1].split(';')[0] if ';' in first_entry[1] else first_entry[1]
+        introduced_by = getattr(alert, "introduced_by", None)
+        if isinstance(introduced_by, list) and introduced_by:
+            first_entry = introduced_by[0]
+            if isinstance(first_entry, (list, tuple)) and len(first_entry) >= 2:
+                manifest_file = (first_entry[1] or "").split(";")[0]
 
-                    # Parse dependency path
-                    if ' > ' in dependency_path_str:
-                        dependency_path = dependency_path_str.split(' > ')
-                        # If there's a chain, it's transitive (not direct)
-                        is_direct = len(dependency_path) <= 1
+        if not manifest_file:
+            manifest_file = (getattr(alert, "manifests", "") or "").split(";")[0]
 
-        elif hasattr(alert, 'manifests') and alert.manifests:
-            manifest_file = alert.manifests.split(';')[0]
+        if not manifest_file:
+            # A transitive package whose ancestors are not in this scan has no
+            # introduced_by chain, but the package still records its own manifest.
+            for entry in getattr(alert, "manifest_files", None) or []:
+                candidate = entry.get("file") if isinstance(entry, dict) else None
+                if candidate:
+                    manifest_file = candidate
+                    break
 
         location = {
-            "file": manifest_file,
+            "file": manifest_file or "unknown",
             "dependency": {
                 "package": {
                     "name": alert.pkg_name
                 },
                 "version": alert.pkg_version,
-                "direct": is_direct
+                "direct": bool(getattr(alert, "direct", False))
             }
         }
 
@@ -539,15 +780,18 @@ class Messages:
                     }
                 },
                 "type": "dependency_scanning",
-                "start_time": datetime.utcnow().isoformat() + "Z",
-                "end_time": datetime.utcnow().isoformat() + "Z",
+                "start_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+                "end_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
                 "status": "success"
             },
-            "vulnerabilities": []
+            "vulnerabilities": [],
+            "dependency_files": []
         }
 
-        # Process each alert
-        for alert in diff.new_alerts:
+        dep_files_map: dict = {}
+
+        all_alerts = list(diff.new_alerts) + list(getattr(diff, 'unchanged_alerts', []))
+        for alert in all_alerts:
             vulnerability = {
                 "id": Messages.generate_uuid_from_alert_gitlab(alert),
                 "category": "dependency_scanning",
@@ -560,13 +804,145 @@ class Messages:
                 "location": Messages.extract_location_gitlab(alert)
             }
 
-            # Add solution if available
             if hasattr(alert, 'suggestion') and alert.suggestion:
                 vulnerability["solution"] = alert.suggestion
 
             gitlab_report["vulnerabilities"].append(vulnerability)
 
+            file_path = vulnerability["location"]["file"]
+            if file_path != "unknown":
+                pkg_manager = Messages._pkg_type_to_package_manager(
+                    alert.pkg_type if hasattr(alert, 'pkg_type') else ""
+                )
+                if file_path not in dep_files_map:
+                    dep_files_map[file_path] = {
+                        "path": file_path,
+                        "package_manager": pkg_manager,
+                        "dependencies": []
+                    }
+                dep_files_map[file_path]["dependencies"].append({
+                    "package": {"name": alert.pkg_name},
+                    "version": alert.pkg_version
+                })
+
+        gitlab_report["dependency_files"] = list(dep_files_map.values())
+
         return gitlab_report
+
+    # A blank line terminates a CommonMark HTML block. When that happens inside
+    # the alerts table the closing tags that follow are no longer treated as
+    # markup, and because they are indented four or more spaces they render as a
+    # literal code block containing `</blockquote></details>` instead.
+    MAX_HTML_INDENT = 3
+
+    @staticmethod
+    def inline_html_text(value) -> str:
+        """
+        Collapses API supplied text onto a single line.
+
+        Alert descriptions and suggestions are interpolated into the comment HTML,
+        so an embedded newline would otherwise be able to close the surrounding
+        HTML block early.
+
+        :param value: The value to flatten. ``None`` becomes an empty string.
+        :return: str - The value with all whitespace runs collapsed to a single space.
+        """
+        if value is None:
+            return ""
+        return " ".join(str(value).split())
+
+    @staticmethod
+    def html_text(value) -> str:
+        """Flatten a value onto one line and escape it for an HTML text node.
+
+        Manifest paths and sources come from the customer's repository, so any PR
+        author controls them: a directory named ``![x](https://host/p.png)`` or
+        carrying a raw tag would otherwise render as that markup inside a comment
+        posted by a trusted integration. Alert text comes from the API and is
+        escaped for the same reason, since neither is markup the CLI authored.
+        """
+        return escape(Messages.inline_html_text(value))
+
+    @staticmethod
+    def html_attr(value) -> str:
+        """Escape a value for an HTML attribute, quotes included.
+
+        Used for href and src, where an unescaped quote closes the attribute and
+        everything after it is read as more attributes.
+        """
+        return escape(Messages.inline_html_text(value), quote=True)
+
+    @staticmethod
+    def comment_marker_text(value) -> str:
+        """Neutralize an HTML comment terminator inside a marker value.
+
+        The alert markers carry the package name so the comment can be rewritten
+        later, and the parser reads them back verbatim -- so this cannot escape the
+        value, only stop it ending the comment early.
+        """
+        return str(value or "").replace("-->", "--&gt;").replace("<!--", "&lt;!--")
+
+    @staticmethod
+    def normalize_comment_html(comment: str) -> str:
+        """
+        Makes generated comment markup safe for the CommonMark renderers used by
+        GitHub and GitLab.
+
+        Drops whitespace-only lines (an optional section that rendered as empty
+        leaves one behind) and caps indentation below the four spaces that would
+        start an indented code block. Intentional separators - lines that are
+        genuinely empty - are preserved so markdown blocks still break apart.
+
+        :param comment: str - The generated comment body.
+        :return: str - The comment body with unrenderable whitespace removed.
+        """
+        lines = []
+        for line in comment.split("\n"):
+            if line and not line.strip():
+                continue
+            stripped = line.lstrip()
+            indent = min(len(line) - len(stripped), Messages.MAX_HTML_INDENT)
+            lines.append(" " * indent + stripped)
+        return "\n".join(lines)
+
+    @staticmethod
+    def security_comment_no_alerts_template(view_report_url: str = "") -> str:
+        """
+        Generates the body used when there is nothing left to report.
+
+        Alerts raised on an early commit are frequently resolved later in the same
+        pull request. Rewriting the comment to this body keeps the Socket comment
+        in place - so a later commit that reintroduces an alert updates it rather
+        than posting a second comment - without leaving the "Caution" banner above
+        an empty alerts table.
+
+        :param view_report_url: str - Optional link to the full Socket report.
+        :return: str - The formatted Markdown/HTML string.
+        """
+        lines = [
+            "<!-- socket-security-comment-actions -->",
+            "",
+            "> **✅ Socket Security**  ",
+            "> No dependency alerts to report. Any alerts previously reported on this "
+            "pull request have been resolved or ignored.",
+        ]
+        if view_report_url:
+            lines += ["", f"[View full report]({view_report_url})"]
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def get_view_report_url(diff: Diff) -> str:
+        """
+        Resolves the report link for a diff, preferring the PR/MR diff view.
+
+        :param diff: Diff - Diff report to pull the URL from.
+        :return: str - The report URL, or an empty string when neither is set.
+        """
+        if getattr(diff, "diff_url", None):
+            return diff.diff_url
+        if getattr(diff, "report_url", None):
+            return diff.report_url
+        return ""
 
     @staticmethod
     def security_comment_template(diff: Diff, config=None) -> str:
@@ -581,7 +957,7 @@ class Messages:
         # Group license policy violations by PURL (ecosystem/package@version)
         license_groups = {}
         security_alerts = []
-        
+
         for alert in diff.new_alerts:
             if alert.type == "licenseSpdxDisj":
                 purl_key = f"{alert.pkg_type}/{alert.pkg_name}@{alert.pkg_version}"
@@ -591,6 +967,13 @@ class Messages:
             else:
                 security_alerts.append(alert)
 
+        view_report_url = Messages.get_view_report_url(diff)
+
+        # Without this the caution banner would sit above a table with no rows,
+        # which is how a comment looks once every alert it raised is resolved.
+        if not security_alerts and not license_groups:
+            return Messages.security_comment_no_alerts_template(view_report_url)
+
         # Start of the comment
         comment = """<!-- socket-security-comment-actions -->
 
@@ -598,7 +981,7 @@ class Messages:
 > **Review the following alerts detected in dependencies.**  
 >  
 > According to your organization's policies, you **must** resolve all **"Block"** alerts before proceeding. It's recommended to resolve **"Warn"** alerts too.  
-> Learn more about [Socket for GitHub](https://socket.dev?utm_medium=gh).
+> Learn more about [Socket](https://socket.dev).
 
 <!-- start-socket-updated-alerts-table -->
 <table>
@@ -612,41 +995,55 @@ class Messages:
   <tbody>
     """
 
+        show_ignore = not (config and getattr(config, 'disable_ignore', False))
+
         # Loop through security alerts (non-license), dynamically generating rows
         for alert in security_alerts:
             severity_icon = Messages.get_severity_icon(alert.severity)
             action = "Block" if alert.error else "Warn"
             details_open = ""
+            patched_version = Messages.get_patched_version(alert)
+            patched_version_html = (
+                "<p><strong>Patched version:</strong> "
+                f"<code>{Messages.html_text(patched_version)}</code></p>"
+                if patched_version else ""
+            )
             # Generate proper manifest URL
             manifest_url = Messages.get_manifest_file_url(diff, alert.manifests, config)
+            pkg_label = Messages.html_text(f"{alert.pkg_name}@{alert.pkg_version}")
+            pkg_marker = Messages.comment_marker_text(f"{alert.pkg_name}@{alert.pkg_version}")
             # Generate a table row for each alert
+            ignore_html = (
+                f"<p><em>Mark as acceptable risk:</em> To ignore this alert only in this pull request, reply with:<br/>"
+                f"<code>@SocketSecurity ignore {Messages.html_text(alert.pkg_type)}/{pkg_label}</code><br/>"
+                f"Or ignore all future alerts with:<br/>"
+                f"<code>@SocketSecurity ignore-all</code></p>"
+            ) if show_ignore else ""
             comment += f"""
-<!-- start-socket-alert-{alert.pkg_name}@{alert.pkg_version} -->
+<!-- start-socket-alert-{pkg_marker} -->
 <tr>
   <td><strong>{action}</strong></td>
   <td align="center">
-      <img src="{severity_icon}" alt="{alert.severity}" width="20" height="20">
+      <img src="{severity_icon}" alt="{Messages.html_attr(alert.severity)}" width="20" height="20">
   </td>
   <td>
     <details {details_open}>
-      <summary>{alert.pkg_name}@{alert.pkg_version} - {alert.title}</summary>
-      <p><strong>Note:</strong> {alert.description}</p>
-      <p><strong>Source:</strong> <a href="{manifest_url}">Manifest File</a></p>
-      <p>ℹ️ Read more on:  
-      <a href="{alert.purl}">This package</a> |  
-      <a href="{alert.url}">This alert</a> |  
+      <summary>{pkg_label} - {Messages.html_text(alert.title)}</summary>
+      <p><strong>Note:</strong> {Messages.html_text(alert.description)}</p>
+      {patched_version_html}
+      <p><strong>Source:</strong> <a href="{Messages.html_attr(manifest_url)}">Manifest File</a></p>
+      <p>ℹ️ Read more on:
+      <a href="{Messages.html_attr(alert.purl)}">This package</a> |
+      <a href="{Messages.html_attr(alert.url)}">This alert</a> |
       <a href="https://socket.dev/alerts/malware">What is known malware?</a></p>
       <blockquote>
-        <p><em>Suggestion:</em> {alert.suggestion}</p>
-        <p><em>Mark as acceptable risk:</em> To ignore this alert only in this pull request, reply with:<br/>
-        <code>@SocketSecurity ignore {alert.pkg_name}@{alert.pkg_version}</code><br/>
-        Or ignore all future alerts with:<br/>
-        <code>@SocketSecurity ignore-all</code></p>
+        <p><em>Suggestion:</em> {Messages.html_text(alert.suggestion)}</p>
+        {ignore_html}
       </blockquote>
     </details>
   </td>
 </tr>
-<!-- end-socket-alert-{alert.pkg_name}@{alert.pkg_version} -->
+<!-- end-socket-alert-{pkg_marker} -->
     """
 
         # Add license policy violation entries grouped by PURL
@@ -657,51 +1054,57 @@ class Messages:
             # Use orange diamond for license policy violations
             license_icon = "🔶"
             
+            license_label = Messages.html_text(
+                f"{first_alert.pkg_name}@{first_alert.pkg_version}"
+            )
+            license_marker = Messages.comment_marker_text(
+                f"{first_alert.pkg_name}@{first_alert.pkg_version}"
+            )
+
             # Build license findings list
             license_findings = []
             for alert in alerts:
                 license_findings.append(alert.title)
             
             comment += f"""
-<!-- start-socket-alert-{first_alert.pkg_name}@{first_alert.pkg_version} -->
+<!-- start-socket-alert-{license_marker} -->
 <tr>
   <td><strong>{action}</strong></td>
   <td align="center">{license_icon}</td>
   <td>
     <details>
-      <summary>{first_alert.pkg_name}@{first_alert.pkg_version} has a License Policy Violation.</summary>
+      <summary>{license_label} has a License Policy Violation.</summary>
       <p><strong>License findings:</strong></p>
       <ul>
 """
             for finding in license_findings:
-                comment += f"        <li>{finding}</li>\n"
+                comment += f"        <li>{Messages.html_text(finding)}</li>\n"
             
             
             # Generate proper manifest URL for license violations
             license_manifest_url = Messages.get_manifest_file_url(diff, first_alert.manifests, config)
-            
+
+            license_ignore_html = (
+                f"<p><em>Mark the package as acceptable risk:</em> To ignore this alert only in this pull request, reply with the comment "
+                f"<code>@SocketSecurity ignore {Messages.html_text(first_alert.pkg_type)}/{license_label}</code>. "
+                f"You can also ignore all packages with <code>@SocketSecurity ignore-all</code>. "
+                f"To ignore an alert for all future pull requests, use Socket's Dashboard to change the triage state of this alert.</p>"
+            ) if show_ignore else ""
             comment += f"""      </ul>
-      <p><strong>From:</strong> <a href="{license_manifest_url}">Manifest File</a></p>
-      <p>ℹ️ Read more on: <a href="{first_alert.purl}">This package</a> | <a href="https://socket.dev/alerts/license">What is a license policy violation?</a></p>
+      <p><strong>From:</strong> <a href="{Messages.html_attr(license_manifest_url)}">Manifest File</a></p>
+      <p>ℹ️ Read more on: <a href="{Messages.html_attr(first_alert.purl)}">This package</a> | <a href="https://socket.dev/alerts/license">What is a license policy violation?</a></p>
       <blockquote>
         <p><em>Next steps:</em> Take a moment to review the security alert above. Review the linked package source code to understand the potential risk. Ensure the package is not malicious before proceeding. If you're unsure how to proceed, reach out to your security team or ask the Socket team for help at <strong>support@socket.dev</strong>.</p>
         <p><em>Suggestion:</em> Find a package that does not violate your license policy or adjust your policy to allow this package's license.</p>
-        <p><em>Mark the package as acceptable risk:</em> To ignore this alert only in this pull request, reply with the comment <code>@SocketSecurity ignore {first_alert.pkg_name}@{first_alert.pkg_version}</code>. You can also ignore all packages with <code>@SocketSecurity ignore-all</code>. To ignore an alert for all future pull requests, use Socket's Dashboard to change the triage state of this alert.</p>
+        {license_ignore_html}
       </blockquote>
     </details>
   </td>
 </tr>
-<!-- end-socket-alert-{first_alert.pkg_name}@{first_alert.pkg_version} -->
+<!-- end-socket-alert-{license_marker} -->
     """
 
         # Close table
-        # Use diff_url for PRs, report_url for non-PR scans
-        view_report_url = ""
-        if hasattr(diff, 'diff_url') and diff.diff_url:
-            view_report_url = diff.diff_url
-        elif hasattr(diff, 'report_url') and diff.report_url:
-            view_report_url = diff.report_url
-            
         comment += f"""
   </tbody>
 </table>
@@ -710,7 +1113,7 @@ class Messages:
 [View full report]({view_report_url}?action=error%2Cwarn)
     """
 
-        return comment
+        return Messages.normalize_comment_html(comment)
 
     @staticmethod
     def get_severity_icon(severity: str) -> str:
@@ -898,6 +1301,22 @@ class Messages:
         md.new_line(removed_line)
         return md
 
+    # Change types the shared badge host publishes an image for. Removed and
+    # replaced have no artwork, so they fall back to a bold text label rather than
+    # rendering a broken image; added and updated render the available badges.
+    DIFF_BADGES = {
+        "Added": "diff-added.svg",
+        "Updated": "diff-updated.svg",
+    }
+
+    @staticmethod
+    def get_diff_badge(change: str, package_url: str) -> str:
+        """Return the Dependency Overview cell marking how a package changed."""
+        badge = Messages.DIFF_BADGES.get(change)
+        if not badge:
+            return f"**{change}**"
+        return f"[![{change}](https://github-app-statics.socket.dev/{badge})]({package_url})"
+
     @staticmethod
     def create_added_table(diff: Diff, md: MdUtils) -> MdUtils:
         """
@@ -919,36 +1338,58 @@ class Messages:
         num_of_overview_columns = len(overview_table)
 
         count = 0
-        for added in diff.new_packages:
-            added: Purl  # Ensure `added` has scores and relevant attributes.
+        changes = (
+            ("Added", diff.new_packages),
+            ("Updated", diff.updated_packages),
+            ("Removed", diff.removed_packages),
+            ("Replaced", diff.replaced_packages),
+        )
+        for change, packages in changes:
+            for package in packages:
+                package: Purl
 
-            package_url = f"[{added.purl}]({added.url})"
-            diff_badge = f"[![+](https://github-app-statics.socket.dev/diff-added.svg)]({added.url})"
+                package_url = f"[{package.purl}]({package.url})"
+                diff_badge = Messages.get_diff_badge(change, package.url)
 
-            # Scores dynamically converted to badge URLs and linked
-            def score_to_badge(score):
-                score_percent = int(score * 100)  # Convert to integer percentage
-                return f"[![{score_percent}](https://github-app-statics.socket.dev/score-{score_percent}.svg)]({added.url})"
+                # Scores dynamically converted to badge URLs and linked
+                def score_to_badge(score):
+                    score_percent = int(score * 100)  # Convert to integer percentage
+                    return f"[![{score_percent}](https://github-app-statics.socket.dev/score-{score_percent}.svg)]({package.url})"
 
-            # Generate badges for each score type
-            supply_chain_risk_badge = score_to_badge(added.scores.get("supplyChain", 100))
-            vulnerability_badge = score_to_badge(added.scores.get("vulnerability", 100))
-            quality_badge = score_to_badge(added.scores.get("quality", 100))
-            maintenance_badge = score_to_badge(added.scores.get("maintenance", 100))
-            license_badge = score_to_badge(added.scores.get("license", 100))
+                def get_score_for_badge(score_name: str) -> float:
+                    scores = getattr(package, "scores", None)
+                    if isinstance(scores, dict):
+                        raw_score = scores.get(score_name)
+                    else:
+                        raw_score = getattr(scores, score_name, None) if scores is not None else None
 
-            # Add the row for this package
-            row = [
-                diff_badge,
-                package_url,
-                supply_chain_risk_badge,
-                vulnerability_badge,
-                quality_badge,
-                maintenance_badge,
-                license_badge
-            ]
-            overview_table.extend(row)
-            count += 1  # Count total packages
+                    if raw_score is None:
+                        return 1.0
+
+                    score = float(raw_score)
+                    if score > 1:
+                        score = score / 100
+                    return max(0.0, min(score, 1.0))
+
+                # Generate badges for each score type
+                supply_chain_risk_badge = score_to_badge(get_score_for_badge("supplyChain"))
+                vulnerability_badge = score_to_badge(get_score_for_badge("vulnerability"))
+                quality_badge = score_to_badge(get_score_for_badge("quality"))
+                maintenance_badge = score_to_badge(get_score_for_badge("maintenance"))
+                license_badge = score_to_badge(get_score_for_badge("license"))
+
+                # Add the row for this package
+                row = [
+                    diff_badge,
+                    package_url,
+                    supply_chain_risk_badge,
+                    vulnerability_badge,
+                    quality_badge,
+                    maintenance_badge,
+                    license_badge
+                ]
+                overview_table.extend(row)
+                count += 1
 
         # Calculate total rows for table
         num_of_overview_rows = count + 1  # Include header row
@@ -983,6 +1424,7 @@ class Messages:
             [
                 "Alert",
                 "Package",
+                "Patched Version",
                 "url",
                 "Introduced by",
                 "Manifest File",
@@ -1003,6 +1445,7 @@ class Messages:
             row = [
                 alert.title,
                 alert.purl,
+                Messages.get_patched_version(alert),
                 alert.url,
                 source_str,
                 manifest_str,
@@ -1018,8 +1461,11 @@ class Messages:
 
         for source, manifest in alert.introduced_by:
             if style == "md":
-                add_str = f"<li>{manifest}</li>"
-                source_str = f"<li>{source}</li>"
+                # These land in rendered Markdown, where an unescaped path is read
+                # as markup. plain and raw are consumed by Slack, Jira and the
+                # console, which do not render HTML, so they stay verbatim.
+                add_str = f"<li>{Messages.html_text(manifest)}</li>"
+                source_str = f"<li>{Messages.html_text(source)}</li>"
             elif style == "plain":
                 add_str = f"• {manifest}"
                 source_str = f"• {source}"

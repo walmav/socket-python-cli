@@ -1,11 +1,13 @@
-import pytest
-from unittest.mock import Mock, patch
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from unittest.mock import Mock
 
-from socketsecurity.core import Core
-from socketsecurity.core.classes import Package, Issue, Alert
-from socketsecurity.core.socket_config import SocketConfig
+import pytest
 from socketdev import socketdev
+from socketdev.fullscans import SocketArtifact
+
+from socketsecurity.core import Core, _humanize_alert_type
+from socketsecurity.core.classes import Issue, Package
+from socketsecurity.core.socket_config import SocketConfig
 
 
 @dataclass
@@ -14,12 +16,32 @@ class MockArtifact:
     name: str
     version: str
     type: str
+    release: str
+    diffType: str
     license: str
+    score: dict
+    alerts: list
     direct: bool
     topLevelAncestors: list
 
 
 class TestPackageAndAlerts:
+    @staticmethod
+    def make_package(**overrides):
+        base = dict(
+            id="pkg:npm/test@1.0.0",
+            name="test",
+            version="1.0.0",
+            type="npm",
+            release="tar-gz",
+            diffType="added",
+            score={},
+            alerts=[],
+            topLevelAncestors=[],
+        )
+        base.update(overrides)
+        return Package(**base)
+
     @pytest.fixture
     def mock_sdk(self):
         mock = Mock(spec=socketdev)
@@ -38,6 +60,10 @@ class TestPackageAndAlerts:
         settings_response = Mock()
         settings_response.success = True
         mock.settings.get = Mock(return_value=settings_response)
+
+        # Set up licensemetadata.post() used by create_packages_dict()
+        mock.licensemetadata = Mock()
+        mock.licensemetadata.post = Mock(return_value=[{"text": ""}])
         
         return mock
     
@@ -61,7 +87,11 @@ class TestPackageAndAlerts:
                 name="test",
                 version="1.0.0",
                 type="npm",
+                release="tar-gz",
+                diffType="added",
                 license="MIT",
+                score={},
+                alerts=[],
                 direct=True,
                 topLevelAncestors=[]
             )
@@ -75,6 +105,93 @@ class TestPackageAndAlerts:
         assert pkg.version == "1.0.0"
         assert pkg.transitives == 0
 
+    def test_full_scan_package_normalizes_enum_type_and_namespace_url(self):
+        artifact = SocketArtifact.from_dict({
+            "id": "pkg:maven/com.example/example-core@1.2.3",
+            "type": "maven",
+            "namespace": "com.example",
+            "name": "example-core",
+            "version": "1.2.3",
+            "direct": True,
+            "topLevelAncestors": [],
+            "manifestFiles": [{"file": "pom.xml"}],
+            "alerts": [],
+        })
+
+        package = Package.from_socket_artifact(asdict(artifact))
+
+        assert package.type == "maven"
+        assert package.purl == "maven/com.example/example-core@1.2.3"
+        assert package.url == (
+            "https://socket.dev/maven/package/com.example/example-core/overview/1.2.3"
+        )
+
+    def test_maven_package_url_separates_group_and_artifact(self):
+        """groupId and artifactId are distinct path segments, not one fused string"""
+        artifact = SocketArtifact.from_dict({
+            "id": "pkg:maven/org.apache.logging.log4j/log4j-api@2.17.2",
+            "type": "maven",
+            "namespace": "org.apache.logging.log4j",
+            "name": "log4j-api",
+            "version": "2.17.2",
+            "direct": True,
+            "topLevelAncestors": [],
+            "manifestFiles": [{"file": "pom.xml"}],
+            "alerts": [],
+        })
+
+        package = Package.from_socket_artifact(asdict(artifact))
+
+        assert package.url == (
+            "https://socket.dev/maven/package/org.apache.logging.log4j/log4j-api"
+            "/overview/2.17.2"
+        )
+        # The purl keeps the "/" form, which is what the purl spec and the purl API want.
+        assert package.purl == "maven/org.apache.logging.log4j/log4j-api@2.17.2"
+
+    def test_non_maven_package_url_keeps_slash_separator(self):
+        """npm scopes and Go module paths stay slash-delimited"""
+        scoped_npm = Package.socket_url("npm", "@babel", "core", "7.0.0")
+        assert scoped_npm == "https://socket.dev/npm/package/@babel/core/overview/7.0.0"
+
+        unscoped = Package.socket_url("nuget", None, "newtonsoft.json", "6.0.8")
+        assert unscoped == "https://socket.dev/nuget/package/newtonsoft.json/overview/6.0.8"
+
+    def test_maven_package_without_namespace_warns(self, caplog):
+        """A Maven coordinate missing its groupId cannot produce a resolvable link"""
+        with caplog.at_level("WARNING", logger="socketdev"):
+            url = Package.socket_url("maven", None, "orphan-artifact", "1.0.0")
+
+        assert url == "https://socket.dev/maven/package/orphan-artifact/overview/1.0.0"
+        assert "orphan-artifact@1.0.0" in caplog.text
+        assert "no namespace" in caplog.text
+
+    def test_namespaced_maven_package_does_not_warn(self, caplog):
+        """The warning is for missing data, not for every Maven package"""
+        with caplog.at_level("WARNING", logger="socketdev"):
+            Package.socket_url("maven", "com.example", "artifact", "1.0.0")
+
+        assert caplog.text == ""
+
+    def test_diff_path_builds_the_same_maven_url_as_the_full_scan_path(self):
+        """Both package construction paths must agree, or links break on only some runs"""
+        package = Package(
+            id="pkg:maven/com.google.code.gson/gson@2.8.6",
+            type="maven",
+            name="gson",
+            version="2.8.6",
+            namespace="com.google.code.gson",
+            score={},
+            alerts=[],
+            topLevelAncestors=[],
+        )
+
+        package = Core.update_package_values(package)
+
+        assert package.url == (
+            "https://socket.dev/maven/package/com.google.code.gson/gson/overview/2.8.6"
+        )
+
     def test_create_packages_dict_with_transitives(self, core):
         """Test package dictionary creation with transitive dependencies"""
         mock_artifacts = [
@@ -83,7 +200,11 @@ class TestPackageAndAlerts:
                 name="parent",
                 version="1.0.0",
                 type="npm",
+                release="tar-gz",
+                diffType="added",
                 license="MIT",
+                score={},
+                alerts=[],
                 direct=True,
                 topLevelAncestors=[]
             ),
@@ -92,7 +213,11 @@ class TestPackageAndAlerts:
                 name="child",
                 version="1.0.0",
                 type="npm",
+                release="tar-gz",
+                diffType="added",
                 license="MIT",
+                score={},
+                alerts=[],
                 direct=False,
                 topLevelAncestors=["pkg:npm/parent@1.0.0"]
             )
@@ -109,11 +234,7 @@ class TestPackageAndAlerts:
 
     def test_add_package_alerts_basic(self, core):
         """Test adding basic alerts to collection"""
-        package = Package(
-            id="pkg:npm/test@1.0.0",
-            name="test",
-            version="1.0.0",
-            type="npm",
+        package = self.make_package(
             alerts=[{
                 "type": "networkAccess",
                 "key": "test-alert",
@@ -133,19 +254,72 @@ class TestPackageAndAlerts:
         assert alert.type == "networkAccess"
         assert alert.severity == "high"
 
+    def test_gpt_did_you_mean_gets_typosquat_title(self, core):
+        """gptDidYouMean alerts must render a non-empty title (CUS2-2)."""
+        package = self.make_package(
+            alerts=[{
+                "type": "gptDidYouMean",
+                "key": "gpt-did-you-mean-alert",
+                "severity": "middle",
+            }],
+            topLevelAncestors=[],
+        )
+
+        result = core.add_package_alerts_to_collection(
+            package, alerts_collection={}, packages={package.id: package}
+        )
+
+        alert = result["gpt-did-you-mean-alert"][0]
+        assert alert.type == "gptDidYouMean"
+        assert alert.title, "title should not be empty for gptDidYouMean"
+        assert "typosquat" in alert.title.lower()
+
+    def test_unknown_alert_type_falls_back_to_humanized_title(self, core):
+        """Any alert type not present in the SDK should still render a non-empty title."""
+        package = self.make_package(
+            alerts=[{
+                "type": "someBrandNewAlertType",
+                "key": "future-alert",
+                "severity": "low",
+            }],
+            topLevelAncestors=[],
+        )
+
+        result = core.add_package_alerts_to_collection(
+            package, alerts_collection={}, packages={package.id: package}
+        )
+
+        alert = result["future-alert"][0]
+        assert alert.title == "Some Brand New Alert Type"
+
+    def test_license_spdx_disj_keeps_explicit_title(self, core):
+        """licenseSpdxDisj must keep its hard-coded fallback (regression guard for CUS2-2 fix)."""
+        package = self.make_package(
+            alerts=[{
+                "type": "licenseSpdxDisj",
+                "key": "license-alert",
+                "severity": "high",
+            }],
+            topLevelAncestors=[],
+        )
+
+        result = core.add_package_alerts_to_collection(
+            package, alerts_collection={}, packages={package.id: package}
+        )
+
+        alert = result["license-alert"][0]
+        assert alert.title == "License Policy Violation"
+
 
 
     def test_get_capabilities_for_added_packages(self, core):
         """Test capability extraction from package alerts"""
         added_packages = {
-            "pkg:npm/test@1.0.0": Package(
-                id="pkg:npm/test@1.0.0",
-                type="npm",
+            "pkg:npm/test@1.0.0": self.make_package(
                 alerts=[{
                     "type": "networkAccess",
                     "key": "test-alert"
                 }],
-                topLevelAncestors=[]
             )
         }
         
@@ -198,4 +372,59 @@ class TestPackageAndAlerts:
         
         # With ignore_readded=False
         new_alerts = Core.get_new_alerts(added_alerts, removed_alerts, ignore_readded=False)
-        assert len(new_alerts) == 1 
+        assert len(new_alerts) == 1
+
+    def test_get_license_text_via_purl_uses_org_scoped_endpoint(self, core, mock_sdk):
+        """Test license enrichment calls the org-scoped PURL SDK method."""
+        core.sdk.purl = Mock()
+        core.sdk.purl.post.return_value = [
+            {
+                "type": "npm",
+                "name": "lodash",
+                "version": "4.18.1",
+                "licenseAttrib": [{"name": "MIT"}],
+                "licenseDetails": [{"license": "MIT"}],
+            }
+        ]
+
+        packages = {
+            "npm/lodash@4.18.1": Package(
+                id="pkg:npm/lodash@4.18.1",
+                type="npm",
+                name="lodash",
+                version="4.18.1",
+                score={},
+                alerts=[],
+                topLevelAncestors=[],
+            )
+        }
+
+        result = core.get_license_text_via_purl(packages)
+
+        core.sdk.purl.post.assert_called_once_with(
+            license=True,
+            components=[{"purl": "pkg:/npm/lodash@4.18.1"}],
+            org_slug="test-org",
+            licenseattrib=True,
+            licensedetails=True,
+        )
+        assert result["npm/lodash@4.18.1"].licenseAttrib == [{"name": "MIT"}]
+        assert result["npm/lodash@4.18.1"].licenseDetails == [{"license": "MIT"}]
+
+
+class TestHumanizeAlertType:
+    def test_humanizes_camel_case(self):
+        assert _humanize_alert_type("gptDidYouMean") == "Gpt Did You Mean"
+
+    def test_humanizes_single_word(self):
+        assert _humanize_alert_type("malware") == "Malware"
+
+    def test_humanizes_pascal_case(self):
+        assert _humanize_alert_type("UnsafeShellAccess") == "Unsafe Shell Access"
+
+    def test_empty_input_returns_empty_string(self):
+        assert _humanize_alert_type("") == ""
+
+    def test_handles_acronyms_conservatively(self):
+        """Adjacent capitals are kept together: SQLInjection -> 'SQL Injection'."""
+        assert _humanize_alert_type("SQLInjection") == "SQL Injection"

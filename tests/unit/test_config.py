@@ -1,5 +1,11 @@
+import tomllib
+from pathlib import Path
+
 import pytest
+
+from socketsecurity.config import CliConfig
 from socketsecurity.core.socket_config import SocketConfig
+
 
 def test_config_default_values():
     """Test that config initializes with correct default values"""
@@ -67,3 +73,219 @@ def test_config_update_org_details():
     assert config.repository_path == "orgs/test-org/repos"
 
 
+class TestCliConfigValidation:
+    """Tests for CliConfig argument validation"""
+
+    BASE_ARGS = ["--api-token", "test-token", "--repo", "test-repo"]
+
+    def test_sarif_reachable_only_is_not_supported(self):
+        """Legacy --sarif-reachable-only is removed; argparse should reject it."""
+        with pytest.raises(SystemExit) as exc_info:
+            CliConfig.from_args(self.BASE_ARGS + ["--sarif-reachable-only", "--reach"])
+        assert exc_info.value.code == 2
+
+    def test_sarif_file_implies_enable_sarif(self):
+        """--sarif-file should automatically set enable_sarif=True"""
+        config = CliConfig.from_args(self.BASE_ARGS + ["--sarif-file", "out.sarif"])
+        assert config.enable_sarif is True
+        assert config.sarif_file == "out.sarif"
+
+    def test_sarif_scope_full_without_reach_exits(self):
+        """--sarif-scope full without --reach should exit with code 1"""
+        with pytest.raises(SystemExit) as exc_info:
+            CliConfig.from_args(self.BASE_ARGS + ["--sarif-scope", "full"])
+        assert exc_info.value.code == 1
+
+    def test_sarif_scope_full_with_reach_succeeds(self):
+        """--sarif-scope full with --reach should parse successfully"""
+        config = CliConfig.from_args(self.BASE_ARGS + ["--sarif-scope", "full", "--reach"])
+        assert config.sarif_scope == "full"
+        assert config.reach is True
+
+    def test_sarif_reachability_without_reach_exits(self):
+        with pytest.raises(SystemExit) as exc_info:
+            CliConfig.from_args(self.BASE_ARGS + ["--sarif-reachability", "reachable"])
+        assert exc_info.value.code == 1
+
+    def test_sarif_reachability_with_reach_succeeds(self):
+        config = CliConfig.from_args(
+            self.BASE_ARGS + ["--reach", "--sarif-scope", "full", "--sarif-reachability", "potentially"]
+        )
+        assert config.sarif_reachability == "potentially"
+        assert config.reach is True
+
+    def test_sarif_grouping_alert_requires_full_scope(self):
+        with pytest.raises(SystemExit) as exc_info:
+            CliConfig.from_args(self.BASE_ARGS + ["--reach", "--sarif-grouping", "alert"])
+        assert exc_info.value.code == 1
+
+    def test_sarif_reachability_reachable_with_reach_succeeds(self):
+        config = CliConfig.from_args(self.BASE_ARGS + ["--reach", "--sarif-reachability", "reachable"])
+        assert config.sarif_reachability == "reachable"
+
+    def test_config_file_toml_sets_defaults(self, tmp_path):
+        config_path = tmp_path / "socketcli.toml"
+        config_path.write_text(
+            "[socketcli]\n"
+            "reach = true\n"
+            "sarif_scope = \"full\"\n"
+            "sarif_grouping = \"alert\"\n"
+            "sarif_reachability = \"reachable\"\n",
+            encoding="utf-8",
+        )
+
+        config = CliConfig.from_args(self.BASE_ARGS + ["--config", str(config_path)])
+        assert config.reach is True
+        assert config.sarif_scope == "full"
+        assert config.sarif_grouping == "alert"
+        assert config.sarif_reachability == "reachable"
+
+    def test_cli_flag_overrides_config_file(self, tmp_path):
+        config_path = tmp_path / "socketcli.toml"
+        config_path.write_text(
+            "[socketcli]\n"
+            "reach = true\n"
+            "sarif_scope = \"full\"\n",
+            encoding="utf-8",
+        )
+
+        config = CliConfig.from_args(
+            self.BASE_ARGS + ["--config", str(config_path), "--sarif-scope", "diff"]
+        )
+        assert config.reach is True
+        assert config.sarif_scope == "diff"
+
+    def test_config_file_json_sets_defaults(self, tmp_path):
+        config_path = tmp_path / "socketcli.json"
+        config_path.write_text(
+            "{\"socketcli\": {\"reach\": true, \"sarif_scope\": \"full\", \"sarif_grouping\": \"alert\", \"sarif_reachability\": \"reachable\"}}",
+            encoding="utf-8",
+        )
+        config = CliConfig.from_args(self.BASE_ARGS + ["--config", str(config_path)])
+        assert config.reach is True
+        assert config.sarif_scope == "full"
+        assert config.sarif_grouping == "alert"
+        assert config.sarif_reachability == "reachable"
+
+
+class TestBaseScanFlags:
+    """Tests for the --base-scan-id / --base-commit-sha diff baseline overrides."""
+
+    BASE_ARGS = ["--api-token", "test-token", "--repo", "test-repo"]
+
+    def test_defaults_are_none(self):
+        config = CliConfig.from_args(self.BASE_ARGS)
+        assert config.base_scan_id is None
+        assert config.base_commit_sha is None
+
+    def test_base_scan_id_parses(self):
+        config = CliConfig.from_args(self.BASE_ARGS + ["--base-scan-id", "scan-123"])
+        assert config.base_scan_id == "scan-123"
+        assert config.base_commit_sha is None
+
+    def test_base_commit_sha_parses(self):
+        config = CliConfig.from_args(self.BASE_ARGS + ["--base-commit-sha", "abc123def"])
+        assert config.base_commit_sha == "abc123def"
+        assert config.base_scan_id is None
+
+    def test_flags_are_mutually_exclusive(self):
+        """argparse rejects both flags on the command line (exit code 2)."""
+        with pytest.raises(SystemExit) as exc_info:
+            CliConfig.from_args(
+                self.BASE_ARGS + ["--base-scan-id", "scan-123", "--base-commit-sha", "abc123def"]
+            )
+        assert exc_info.value.code == 2
+
+    def test_config_file_values_are_mutually_exclusive(self, tmp_path):
+        """Both values arriving via --config bypass argparse's group; from_args catches it."""
+        config_path = tmp_path / "socketcli.toml"
+        config_path.write_text(
+            "[socketcli]\n"
+            "base_scan_id = \"scan-123\"\n"
+            "base_commit_sha = \"abc123def\"\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            CliConfig.from_args(self.BASE_ARGS + ["--config", str(config_path)])
+        assert exc_info.value.code == 1
+
+    def test_config_file_sets_base_commit_sha(self, tmp_path):
+        config_path = tmp_path / "socketcli.toml"
+        config_path.write_text(
+            "[socketcli]\nbase_commit_sha = \"abc123def\"\n",
+            encoding="utf-8",
+        )
+        config = CliConfig.from_args(self.BASE_ARGS + ["--config", str(config_path)])
+        assert config.base_commit_sha == "abc123def"
+
+
+class TestReachAlignmentFlags:
+    """Tests for the reachability flag/default alignment with the Node CLI."""
+
+    BASE_ARGS = ["--api-token", "test-token", "--repo", "test-repo"]
+
+    def test_reach_defaults_are_unset_and_delegated_to_coana(self):
+        """memory-limit/concurrency/timeout are not hardcoded; omitted so coana applies its
+        own defaults (8192 MB / concurrency 1 / 600s), which already match what we'd set."""
+        config = CliConfig.from_args(self.BASE_ARGS + ["--reach"])
+        assert config.reach_analysis_memory_limit is None
+        assert config.reach_concurrency is None
+        assert config.reach_analysis_timeout is None
+
+    def test_reach_node_style_name_aliases(self):
+        """G8: Node-style primary names map to the same dests. Values are kept as raw
+        strings and forwarded verbatim to coana (coana owns unit parsing)."""
+        config = CliConfig.from_args(
+            self.BASE_ARGS
+            + ["--reach", "--reach-analysis-timeout", "300", "--reach-analysis-memory-limit", "2048"]
+        )
+        assert config.reach_analysis_timeout == "300"
+        assert config.reach_analysis_memory_limit == "2048"
+
+    def test_reach_legacy_name_aliases_still_work(self):
+        """G8: pre-alignment names keep working (hidden aliases)."""
+        config = CliConfig.from_args(
+            self.BASE_ARGS + ["--reach", "--reach-timeout", "111", "--reach-memory-limit", "512"]
+        )
+        assert config.reach_analysis_timeout == "111"
+        assert config.reach_analysis_memory_limit == "512"
+
+    def test_reach_unit_suffixes_are_passed_through_verbatim(self):
+        """Unit-bearing values (parsed/validated by coana) are stored as-is, not coerced."""
+        config = CliConfig.from_args(
+            self.BASE_ARGS
+            + ["--reach", "--reach-analysis-timeout", "10m", "--reach-analysis-memory-limit", "8GB"]
+        )
+        assert config.reach_analysis_timeout == "10m"
+        assert config.reach_analysis_memory_limit == "8GB"
+
+    def test_reach_debug_flag(self):
+        """G9: dedicated --reach-debug flag, independent of --enable-debug."""
+        config = CliConfig.from_args(self.BASE_ARGS + ["--reach", "--reach-debug"])
+        assert config.reach_debug is True
+        assert config.enable_debug is False
+
+    def test_reach_disable_external_tool_checks_flag(self):
+        """G1: --reach-disable-external-tool-checks parses to its dest."""
+        config = CliConfig.from_args(
+            self.BASE_ARGS + ["--reach", "--reach-disable-external-tool-checks"]
+        )
+        assert config.reach_disable_external_tool_checks is True
+
+    def test_reach_new_flags_default_false(self):
+        config = CliConfig.from_args(self.BASE_ARGS + ["--reach"])
+        assert config.reach_debug is False
+        assert config.reach_disable_external_tool_checks is False
+
+
+def test_pyproject_requires_python_matches_tomllib_usage():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    requires_python = pyproject["project"]["requires-python"]
+
+    assert requires_python.startswith(">=")
+
+    minimum_version = tuple(int(part) for part in requires_python.removeprefix(">=").split(".")[:2])
+    config_module = Path("socketsecurity/config.py").read_text(encoding="utf-8")
+
+    if "import tomllib" in config_module:
+        assert minimum_version >= (3, 11)

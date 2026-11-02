@@ -1,0 +1,385 @@
+import sys
+
+import pytest
+
+from socketsecurity import socketcli
+from socketsecurity.config import CliConfig
+from socketsecurity.core.classes import Diff, Package
+from socketsecurity.socketcli import (
+    build_license_artifact_payload,
+    should_write_comment,
+)
+
+# ---------------------------------------------------------------------------
+# Exit-code-on-api-error (flag-only, non-breaking for 2.3.x).
+#
+# Default behavior is unchanged from prior releases: unexpected errors exit 3,
+# and --disable-blocking forces exit 0 for everything. The flag only changes
+# the code when explicitly set, and --disable-blocking still takes precedence.
+# ---------------------------------------------------------------------------
+
+
+def _run_cli_expecting_exit(monkeypatch, argv, boom=None):
+    def fail_main_code():
+        raise (boom or RuntimeError("infra boom"))
+
+    monkeypatch.setattr(socketcli, "main_code", fail_main_code)
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc_info:
+        socketcli.cli()
+    return exc_info.value.code
+
+
+def test_unexpected_error_exits_3_by_default(monkeypatch):
+    code = _run_cli_expecting_exit(monkeypatch, ["socketcli", "--api-token", "test"])
+    assert code == 3
+
+
+def test_exit_code_on_api_error_remaps_failure(monkeypatch):
+    code = _run_cli_expecting_exit(
+        monkeypatch,
+        ["socketcli", "--api-token", "test", "--exit-code-on-api-error", "100"],
+    )
+    assert code == 100
+
+
+def test_disable_blocking_overrides_exit_code_on_api_error(monkeypatch):
+    # The documented interaction: --disable-blocking forces exit 0 for ALL
+    # outcomes and therefore overrides --exit-code-on-api-error. A user who
+    # sets both gets 0, NOT 100 -- this guards against silently regressing
+    # that precedence (which would break the documented soft_fail guidance).
+    code = _run_cli_expecting_exit(
+        monkeypatch,
+        [
+            "socketcli", "--api-token", "test",
+            "--exit-code-on-api-error", "100",
+            "--disable-blocking",
+        ],
+    )
+    assert code == 0
+
+
+def test_keyboard_interrupt_still_exits_2(monkeypatch):
+    code = _run_cli_expecting_exit(
+        monkeypatch, ["socketcli", "--api-token", "test"], boom=KeyboardInterrupt()
+    )
+    assert code == 2
+
+
+@pytest.mark.parametrize("scm", ["github", "gitlab"])
+def test_pr_context_provider_prefers_active_scm_adapter(scm):
+    assert socketcli._select_pull_request_provider("api", scm) == scm
+
+
+def test_pr_context_provider_uses_integration_without_comment_adapter():
+    assert socketcli._select_pull_request_provider("azure", "api") == "azure"
+
+
+# ---------------------------------------------------------------------------
+# SCM scan selection.
+#
+# Only a pull request or merge request event has a baseline, so every other
+# pipeline gets a full scan. These drive create_scm_scan against a recording
+# stub rather than asserting on a predicate, so they fail if the branch stops
+# reaching create_full_scan_with_report_url.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingCore:
+    def __init__(self):
+        self.calls = []
+
+    def create_new_diff(self, *args, **kwargs):
+        self.calls.append(("create_new_diff", args, kwargs))
+        return Diff(id="diff-scan")
+
+    def create_full_scan_with_report_url(self, *args, **kwargs):
+        self.calls.append(("create_full_scan_with_report_url", args, kwargs))
+        return Diff(id="full-scan")
+
+
+def _run_scm_scan(scm_event_type, **overrides):
+    core = _RecordingCore()
+    config = CliConfig.from_args(["--api-token", "test"])
+    diff, comparison_ran = socketcli.create_scm_scan(
+        core,
+        config,
+        scm_event_type,
+        **{
+            "scan_paths": ["."],
+            "params": object(),
+            "no_change": False,
+            "base_paths": None,
+            "explicit_files": None,
+            "external_href": "https://github.com/acme/widgets/pull/42",
+            **overrides,
+        },
+    )
+    return core, diff, comparison_ran
+
+
+def test_pull_request_event_creates_a_comparison_with_the_pr_link():
+    core, diff, comparison_ran = _run_scm_scan("diff")
+
+    method, _, kwargs = core.calls[0]
+    assert method == "create_new_diff"
+    assert kwargs["external_href"] == "https://github.com/acme/widgets/pull/42"
+    assert comparison_ran is True
+    assert diff.id == "diff-scan"
+
+
+@pytest.mark.parametrize("scm_event_type", ["main", None])
+def test_branch_event_creates_a_full_scan(scm_event_type):
+    core, diff, comparison_ran = _run_scm_scan(scm_event_type)
+
+    method, _, kwargs = core.calls[0]
+    assert method == "create_full_scan_with_report_url"
+    # A full scan has no before/after pair to associate the link with.
+    assert "external_href" not in kwargs
+    assert comparison_ran is False
+    assert diff.id == "full-scan"
+
+
+def test_api_only_diff_flags_do_not_force_a_comparison_on_a_branch_build():
+    """The detected event type is authoritative once an SCM adapter is active."""
+    core = _RecordingCore()
+    config = CliConfig.from_args(["--api-token", "test", "--enable-diff"])
+
+    _, comparison_ran = socketcli.create_scm_scan(
+        core,
+        config,
+        "main",
+        scan_paths=["."],
+        params=object(),
+        no_change=False,
+        base_paths=None,
+        explicit_files=None,
+        external_href=None,
+    )
+
+    assert core.calls[0][0] == "create_full_scan_with_report_url"
+    assert comparison_ran is False
+
+
+# ---------------------------------------------------------------------------
+# Buildkite-aware infrastructure error formatting.
+# ---------------------------------------------------------------------------
+
+
+def test_emit_infra_error_no_buildkite_has_no_markers(monkeypatch, capsys, caplog):
+    monkeypatch.setattr(socketcli, "IS_BUILDKITE", False)
+    with caplog.at_level("ERROR", logger="socketcli"):
+        socketcli._emit_infrastructure_error("something failed")
+    out = capsys.readouterr().out
+    assert "^^^ +++" not in out
+    assert "--- :warning:" not in out
+    assert "soft_fail" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_emit_infra_error_buildkite_emits_markers(monkeypatch, capsys, caplog):
+    monkeypatch.setattr(socketcli, "IS_BUILDKITE", True)
+    with caplog.at_level("ERROR", logger="socketcli"):
+        socketcli._emit_infrastructure_error("something failed")
+    out = capsys.readouterr().out
+    assert "^^^ +++" in out
+    assert "--- :warning: Socket infrastructure error" in out
+    assert "soft_fail" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_emit_infra_error_traceback_gated(monkeypatch, capsys):
+    monkeypatch.setattr(socketcli, "IS_BUILDKITE", False)
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        socketcli._emit_infrastructure_error("wrapped", include_traceback=True)
+    err = capsys.readouterr().err
+    assert "Traceback" in err and "ValueError: boom" in err
+
+
+def test_scan_mode_fallback_log_is_structured(caplog):
+    with caplog.at_level("INFO", logger="socketcli"):
+        socketcli._log_scan_mode_fallback(
+            "diff",
+            "full",
+            "no-supported-manifest-in-changed-files",
+        )
+
+    assert (
+        "Scan mode: requested=diff effective=full "
+        "reason=no-supported-manifest-in-changed-files"
+    ) in caplog.messages
+
+
+def test_build_license_artifact_payload_without_packages_returns_empty_dict():
+    diff = Diff()
+
+    payload = build_license_artifact_payload(diff)
+
+    assert payload == {}
+
+
+def test_build_license_artifact_payload_serializes_package_fields():
+    diff = Diff()
+    diff.packages = {
+        "pypi/requests@2.31.0": Package(
+            id="pkg-1",
+            name="requests",
+            version="2.31.0",
+            type="pypi",
+            score={},
+            alerts=[],
+            direct=True,
+            url="https://socket.dev/pypi/package/requests/overview/2.31.0",
+            license="Apache-2.0",
+            licenseDetails=[{"id": "Apache-2.0"}],
+            licenseAttrib=[{"id": "Apache-2.0"}],
+            purl="requests@2.31.0",
+        )
+    }
+
+    payload = build_license_artifact_payload(diff)
+
+    assert payload == {
+        "pkg-1": {
+            "id": "pkg-1",
+            "name": "requests",
+            "version": "2.31.0",
+            "ecosystem": "pypi",
+            "direct": True,
+            "url": "https://socket.dev/pypi/package/requests/overview/2.31.0",
+            "license": "Apache-2.0",
+            "licenseDetails": [{"id": "Apache-2.0"}],
+            "licenseAttrib": [{"id": "Apache-2.0"}],
+            "purl": "requests@2.31.0",
+        }
+    }
+
+
+def test_build_license_artifact_payload_fossa_format_without_packages():
+    class Config:
+        repo = "owner/repo"
+        branch = "main"
+
+    diff = Diff(id="scan-1", report_url="https://socket.dev/report/1")
+
+    payload = build_license_artifact_payload(diff, legal_format="fossa", config=Config())
+
+    assert payload == {
+        "copyrightsByLicense": {},
+        "deepDependencies": [],
+        "directDependencies": [],
+        "licenses": {},
+        "project": {"name": "owner/repo", "revision": "scan-1"},
+    }
+
+
+def test_fossa_attribution_file_is_written_indented(tmp_path):
+    """fossa-sbom.json should be written with indent=2, matching fossa-analyze.json."""
+    import json
+    from types import SimpleNamespace
+
+    from socketsecurity import socketcli
+
+    target = tmp_path / "fossa-sbom.json"
+    config = SimpleNamespace(license_file_name=str(target))
+    payload = {
+        "copyrightsByLicense": {},
+        "deepDependencies": [],
+        "directDependencies": [],
+        "licenses": {},
+        "project": {"name": "x", "revision": "y"},
+    }
+    socketcli._write_attribution_file(config, payload)
+    content = target.read_text()
+    assert "\n  " in content, f"Expected indented JSON, got: {content!r}"
+    assert json.loads(content) == payload
+
+
+def test_build_license_artifact_payload_fossa_format_serializes_dependencies():
+    class Config:
+        repo = "owner/repo"
+        branch = "main"
+
+    diff = Diff(id="scan-1", report_url="https://socket.dev/report/1")
+    diff.packages = {
+        "pkg:pypi/requests@2.31.0": Package(
+            id="pkg-1",
+            name="requests",
+            version="2.31.0",
+            type="pypi",
+            score={},
+            alerts=[],
+            direct=True,
+            url="https://socket.dev/pypi/package/requests/overview/2.31.0",
+            license="Apache-2.0",
+            licenseDetails=[{"id": "Apache-2.0"}],
+            licenseAttrib=[{"id": "Apache-2.0"}],
+            purl="pkg:pypi/requests@2.31.0",
+        )
+    }
+
+    payload = build_license_artifact_payload(diff, legal_format="fossa", config=Config())
+
+    assert payload["project"] == {"name": "owner/repo", "revision": "scan-1"}
+    assert payload["directDependencies"] == [{
+        "authors": [],
+        "dependencyPaths": ["requests"],
+        "description": "",
+        "downloadUrl": "",
+        "hash": None,
+        "isGolang": None,
+        "licenses": [{"attribution": "", "name": "Apache-2.0"}],
+        "notes": [],
+        "otherLicenses": [],
+        "package": "requests",
+        "projectUrl": "",
+        "source": "pip",
+        "title": "requests",
+        "version": "2.31.0",
+    }]
+    assert payload["deepDependencies"] == []
+    assert payload["copyrightsByLicense"] == {}
+    assert payload["licenses"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Comment write decision.
+#
+# --disable-security-issue used to be checked only after the "is there already
+# a comment" test, so it suppressed the first post on a pull request and then
+# updated that comment with the full alerts table on every later run.
+# ---------------------------------------------------------------------------
+
+
+class TestShouldWriteComment:
+    def test_disabled_never_writes_even_when_a_comment_exists(self):
+        assert should_write_comment(
+            disabled=True, has_findings=True, update_existing=True
+        ) is False
+
+    def test_disabled_never_writes_with_no_existing_comment(self):
+        assert should_write_comment(
+            disabled=True, has_findings=True, update_existing=False
+        ) is False
+
+    def test_disabled_wins_over_findings(self):
+        """The flag is not conditional on there being nothing to report."""
+        assert should_write_comment(
+            disabled=True, has_findings=False, update_existing=True
+        ) is False
+
+    def test_findings_are_written(self):
+        assert should_write_comment(
+            disabled=False, has_findings=True, update_existing=False
+        ) is True
+
+    def test_no_findings_refreshes_an_existing_comment(self):
+        """So a resolved alerts table gets cleared rather than left stale."""
+        assert should_write_comment(
+            disabled=False, has_findings=False, update_existing=True
+        ) is True
+
+    def test_no_findings_does_not_open_a_new_comment(self):
+        assert should_write_comment(
+            disabled=False, has_findings=False, update_existing=False
+        ) is False

@@ -1,24 +1,30 @@
 [build-system]
 requires = [
-  "hatchling"
+  "hatchling==1.32.4"
 ]
 build-backend = "hatchling.build"
 
 [project]
 name = "socketsecurity"
-version = "2.2.71"
-requires-python = ">= 3.10"
+version = "2.11.8"
+requires-python = ">= 3.11"
 license = {"file" = "LICENSE"}
 dependencies = [
-    'requests',
-    'mdutils',
-    'prettytable',
-    'GitPython',
-    'packaging',
-    'python-dotenv',
-    "socketdev>=3.0.29,<4.0.0",
-    "bs4>=0.0.2",
-    "markdown>=3.10",
+    "requests==2.34.2",
+    "mdutils==1.8.1",
+    "prettytable==3.18.0",
+    "gitpython==3.2.1",
+    "packaging==26.3",
+    "python-dotenv==1.2.4",
+    "socketdev==3.6.1",
+    "beautifulsoup4==4.15.0",
+    "markdown==3.11.2",
+    "brotli==1.2.1; platform_python_implementation == 'CPython'",
+    "brotlicffi==1.2.1.0; platform_python_implementation != 'CPython'",
+    # requests' CA bundle. A floor rather than an exact pin, so later trust-store
+    # fixes still reach installs; 2026.10.19 drops the roots behind the
+    # compromised eMudhra intermediates.
+    "certifi>=2026.10.19",
 ]
 readme = "README.md"
 description = "Socket Security CLI for CI/CD"
@@ -38,18 +44,18 @@ classifiers = [
 
 [project.optional-dependencies]
 test = [
-    "pytest>=7.4.0",
-    "pytest-cov>=4.1.0",
-    "pytest-mock>=3.12.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-watch >=4.2.0"
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "pytest-mock==3.17.0",
+    "pytest-asyncio==1.4.0",
+    "pytest-watch==4.2.0"
 ]
 dev = [
-    "ruff>=0.3.0",
-    "twine", # for building
-    "uv>=0.1.0",  # for dependency management
-    "pre-commit",
-    "hatch"
+    "ruff==0.17.2",
+    "twine==7.0.0", # for building
+    "uv==0.13.5",  # for dependency management
+    "pre-commit==4.7.0",
+    "hatch==1.18.1"
 ]
 
 [project.scripts]
@@ -166,4 +172,3 @@ include = ["socketsecurity", "LICENSE"]
 dev = [
     "pre-commit>=4.3.0",
 ]
-

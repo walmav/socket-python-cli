@@ -1,11 +1,14 @@
 import argparse
+import json
 import logging
 import os
+import tomllib
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
-from socketsecurity import __version__
+
 from socketdev import INTEGRATION_TYPES, IntegrationType
-import json
+
+from socketsecurity import __version__
 
 
 def get_plugin_config_from_env(prefix: str) -> dict:
@@ -14,6 +17,115 @@ def get_plugin_config_from_env(prefix: str) -> dict:
         return json.loads(config_str)
     except json.JSONDecodeError:
         return {}
+
+
+# commit_message rides in the query string of POST /v0/orgs/{org}/full-scans, so an
+# oversized message overflows the edge proxy's request line limit before the API ever
+# sees it. The API itself has no length validation on the field; the rejection comes
+# from the proxy, which reports 413, 414 or 431 depending on which limit it checks. 200
+# chars is a conservative ceiling given URL encoding can 2-3x the raw character count.
+MAX_COMMIT_MESSAGE_LENGTH = 200
+
+
+COMMIT_MESSAGE_TRUNCATION_MARKER = "..."
+
+
+def truncate_commit_message(commit_message: Optional[str]) -> Optional[str]:
+    """Cap commit_message to a length the full-scan request line can carry."""
+    if commit_message and len(commit_message) > MAX_COMMIT_MESSAGE_LENGTH:
+        # INFO, not DEBUG: the scan keeps the truncated value, so for a CI job that does
+        # not pass --enable-debug this line is the only explanation of why the message in
+        # the dashboard is clipped.
+        logging.info(
+            f"commit_message truncated from {len(commit_message)} to "
+            f"{MAX_COMMIT_MESSAGE_LENGTH} characters to stay within API request size limits"
+        )
+        keep = MAX_COMMIT_MESSAGE_LENGTH - len(COMMIT_MESSAGE_TRUNCATION_MARKER)
+        return commit_message[:keep] + COMMIT_MESSAGE_TRUNCATION_MARKER
+    return commit_message
+
+
+def load_cli_config_file(config_path: str) -> dict:
+    """
+    Load CLI defaults from a JSON or TOML file.
+
+    Supported structures:
+    - Flat keys: {"sarif_scope": "full", "reach": true}
+    - Namespaced keys:
+      - JSON: {"socketcli": {...}}
+      - TOML: [socketcli]
+    """
+    if not config_path:
+        return {}
+
+    try:
+        with open(config_path, "rb") as f:
+            if config_path.lower().endswith(".json"):
+                data = json.loads(f.read().decode("utf-8"))
+            elif config_path.lower().endswith(".toml"):
+                data = tomllib.load(f)
+            else:
+                logging.error("--config must be a .json or .toml file")
+                exit(1)
+    except FileNotFoundError:
+        logging.error(f"Config file not found: {config_path}")
+        exit(1)
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError) as e:
+        logging.error(f"Invalid config file format: {e}")
+        exit(1)
+
+    if not isinstance(data, dict):
+        logging.error("Config file must contain a top-level object/table")
+        exit(1)
+
+    scoped = data.get("socketcli")
+    if isinstance(scoped, dict):
+        return scoped
+    return data
+
+def normalize_exclude_paths(value) -> Optional[List[str]]:
+    """Normalize a --exclude-paths value into a clean list of patterns.
+
+    Accepts a comma-separated string (CLI) or a list/tuple (e.g. a JSON/TOML --config file
+    value), so config-file-supplied patterns flow through the same validation as CLI ones.
+    """
+    if not value:
+        return None
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return None
+    cleaned = [str(p).strip() for p in items if str(p).strip()]
+    return cleaned or None
+
+
+def validate_exclude_paths(patterns: List[str]) -> None:
+    """Validate --exclude-paths patterns (mirrors Node's assertValidExcludePaths).
+
+    Patterns are scan-root-relative globs. Reject the cases coana's --exclude-dirs / fast-glob
+    cannot honor: negation, absolute paths, ``..`` traversal, and degenerate match-everything.
+    Exits with code 1 on the first invalid pattern.
+    """
+    # Degenerate match-everything forms, compared against the trailing-slash-stripped pattern
+    # (so "**/" reduces to "**" and is rejected, matching Node's stripTrailingSlash + check).
+    degenerate = {"", ".", "**", "./**", "/**"}
+    for p in patterns:
+        norm = (p or "").strip().replace("\\", "/")
+        if norm.startswith("!"):
+            logging.error(f"--exclude-paths: negation patterns are not supported: {p!r}")
+            exit(1)
+        if norm.startswith("/"):
+            logging.error(f"--exclude-paths: patterns must be scan-root relative (no leading '/'): {p!r}")
+            exit(1)
+        if norm == ".." or norm.startswith("../") or "/../" in norm or norm.endswith("/.."):
+            logging.error(f"--exclude-paths: '..' path traversal is not allowed: {p!r}")
+            exit(1)
+        if norm.rstrip("/") in degenerate:
+            logging.error(f"--exclude-paths: pattern would exclude everything: {p!r}")
+            exit(1)
+
 
 @dataclass
 class PluginConfig:
@@ -29,34 +141,52 @@ class CliConfig:
     branch: str = ""
     committers: Optional[List[str]] = None
     pr_number: str = "0"
+    pr_number_explicit: bool = False
     commit_message: Optional[str] = None
     default_branch: bool = False
     target_path: str = "./"
     scm: str = "api"
     sbom_file: Optional[str] = None
     commit_sha: str = ""
+    base_scan_id: Optional[str] = None
+    base_commit_sha: Optional[str] = None
     generate_license: bool = False
     enable_debug: bool = False
     allow_unverified: bool = False
     enable_json: bool = False
+    json_file: Optional[str] = None
     enable_sarif: bool = False
+    sarif_file: Optional[str] = None
+    sarif_scope: str = "diff"
+    sarif_grouping: str = "instance"
+    sarif_reachability: str = "all"
     enable_gitlab_security: bool = False
     gitlab_security_file: Optional[str] = None
+    summary_file: Optional[str] = None
+    report_link_file: Optional[str] = None
     disable_overview: bool = False
     disable_security_issue: bool = False
     files: str = None
     ignore_commit_files: bool = False
     disable_blocking: bool = False
+    disable_ignore: bool = False
+    ignore_authorization: str = "enforce"
+    # Tri-state log-upload preference: True = --upload-logs, False = --no-upload-logs,
+    # None = neither (server-side override decides).
+    upload_logs: Optional[bool] = None
     strict_blocking: bool = False
     integration_type: IntegrationType = "api"
     integration_org_slug: Optional[str] = None
     pending_head: bool = False
     enable_diff: bool = False
     timeout: Optional[int] = 1200
+    exit_code_on_api_error: int = 3
     exclude_license_details: bool = False
     include_module_folders: bool = False
     repo_is_public: bool = False
     excluded_ecosystems: list[str] = field(default_factory=lambda: [])
+    exclude_paths: Optional[List[str]] = None
+    included_dirs: List[str] = field(default_factory=lambda: [])
     version: str = __version__
     jira_plugin: PluginConfig = field(default_factory=PluginConfig)
     slack_plugin: PluginConfig = field(default_factory=PluginConfig)
@@ -66,16 +196,17 @@ class CliConfig:
     save_manifest_tar: Optional[str] = None
     sub_paths: List[str] = field(default_factory=list)
     workspace_name: Optional[str] = None
+    workspace: Optional[str] = None
     # Reachability Flags
     reach: bool = False
     reach_version: Optional[str] = None
-    reach_analysis_memory_limit: Optional[int] = None
-    reach_analysis_timeout: Optional[int] = None
+    reach_analysis_memory_limit: Optional[str] = None
+    reach_analysis_timeout: Optional[str] = None
     reach_disable_analytics: bool = False
     reach_disable_analysis_splitting: bool = False  # Deprecated, kept for backwards compatibility
     reach_enable_analysis_splitting: bool = False
     reach_detailed_analysis_log_file: bool = False
-    reach_lazy_mode: bool = False
+    reach_lazy_mode: bool = False  # Deprecated, kept for backwards compatibility
     reach_ecosystems: Optional[List[str]] = None
     reach_exclude_paths: Optional[List[str]] = None
     reach_skip_cache: bool = False
@@ -85,12 +216,61 @@ class CliConfig:
     reach_additional_params: Optional[List[str]] = None
     only_facts_file: bool = False
     reach_use_only_pregenerated_sboms: bool = False
+    reach_continue_on_analysis_errors: bool = False
+    reach_continue_on_install_errors: bool = False
+    reach_continue_on_missing_lock_files: bool = False
+    reach_continue_on_no_source_files: bool = False
+    reach_debug: bool = False
+    reach_disable_external_tool_checks: bool = False
+    reach_disable_dependency_downloads: bool = False
     max_purl_batch_size: int = 5000
-    
+    enable_commit_status: bool = False
+    legal: bool = False
+    legal_format: str = "socket"
+    config_file: Optional[str] = None
+
+    def __post_init__(self):
+        # Capped on construction so that every source of commit_message -- the
+        # --commit-message flag, a config file, the git backfill in socketcli -- lands
+        # under the limit.
+        self.commit_message = truncate_commit_message(self.commit_message)
+
     @classmethod
     def from_args(cls, args_list: Optional[List[str]] = None) -> 'CliConfig':
         parser = create_argument_parser()
+
+        pre_parser = argparse.ArgumentParser(add_help=False)
+        pre_parser.add_argument("--config", dest="config_file", default=None)
+        pre_args, _ = pre_parser.parse_known_args(args_list)
+
+        if pre_args.config_file:
+            config_defaults = load_cli_config_file(pre_args.config_file)
+            valid_dests = {action.dest for action in parser._actions if action.dest != "help"}
+            normalized_defaults = {}
+            for key, value in config_defaults.items():
+                dest = str(key).replace("-", "_")
+                if dest in valid_dests:
+                    normalized_defaults[dest] = value
+            parser.set_defaults(**normalized_defaults)
+
         args = parser.parse_args(args_list)
+        integration_explicit = hasattr(args, "integration")
+        pr_number_explicit = hasattr(args, "pr_number")
+
+        integration_type = getattr(args, "integration", "api")
+        pr_number = getattr(args, "pr_number", "0")
+        if (
+            not integration_explicit and
+            integration_type == "api" and
+            args.scm in ("github", "gitlab")
+        ):
+            integration_type = args.scm
+
+        if args.reach_exclude_paths:
+            logging.warning(
+                "--reach-exclude-paths is deprecated; use --exclude-paths instead. "
+                "It is still honored and unioned with --exclude-paths."
+            )
 
         # Get API token from env or args (check multiple env var names)
         api_token = (
@@ -100,6 +280,10 @@ class CliConfig:
             os.getenv("SOCKET_API_TOKEN") or
             args.api_token
         )
+
+        # --sarif-file implies --enable-sarif
+        if args.sarif_file:
+            args.enable_sarif = True
 
         # Strip quotes from commit message if present
         commit_message = args.commit_message
@@ -111,30 +295,44 @@ class CliConfig:
             'repo': args.repo,
             'branch': args.branch,
             'committers': args.committers,
-            'pr_number': args.pr_number,
+            'pr_number': pr_number,
+            'pr_number_explicit': pr_number_explicit,
             'commit_message': commit_message,
             'default_branch': args.default_branch,
             'target_path': os.path.expanduser(args.target_path),
             'scm': args.scm,
             'sbom_file': args.sbom_file,
             'commit_sha': args.commit_sha,
+            'base_scan_id': args.base_scan_id,
+            'base_commit_sha': args.base_commit_sha,
             'generate_license': args.generate_license,
             'enable_debug': args.enable_debug,
             'enable_diff': args.enable_diff,
             'allow_unverified': args.allow_unverified,
             'enable_json': args.enable_json,
+            'json_file': args.json_file,
             'enable_sarif': args.enable_sarif,
+            'sarif_file': args.sarif_file,
+            'sarif_scope': args.sarif_scope,
+            'sarif_grouping': args.sarif_grouping,
+            'sarif_reachability': args.sarif_reachability,
             'enable_gitlab_security': args.enable_gitlab_security,
             'gitlab_security_file': args.gitlab_security_file,
+            'summary_file': args.summary_file,
+            'report_link_file': args.report_link_file,
             'disable_overview': args.disable_overview,
             'disable_security_issue': args.disable_security_issue,
             'files': args.files,
             'ignore_commit_files': args.ignore_commit_files,
             'disable_blocking': args.disable_blocking,
+            'disable_ignore': args.disable_ignore,
+            'ignore_authorization': args.ignore_authorization,
+            'upload_logs': args.upload_logs,
             'strict_blocking': args.strict_blocking,
-            'integration_type': args.integration,
+            'integration_type': integration_type,
             'pending_head': args.pending_head,
             'timeout': args.timeout,
+            'exit_code_on_api_error': args.exit_code_on_api_error,
             'exclude_license_details': args.exclude_license_details,
             'include_module_folders': args.include_module_folders,
             'repo_is_public': args.repo_is_public,
@@ -144,6 +342,7 @@ class CliConfig:
             'save_manifest_tar': args.save_manifest_tar,
             'sub_paths': args.sub_paths or [],
             'workspace_name': args.workspace_name,
+            'workspace': args.workspace,
             'slack_webhook': args.slack_webhook,
             'reach': args.reach,
             'reach_version': args.reach_version,
@@ -156,6 +355,8 @@ class CliConfig:
             'reach_lazy_mode': args.reach_lazy_mode,
             'reach_ecosystems': args.reach_ecosystems.split(',') if args.reach_ecosystems else None,
             'reach_exclude_paths': args.reach_exclude_paths.split(',') if args.reach_exclude_paths else None,
+            'exclude_paths': normalize_exclude_paths(args.exclude_paths),
+            'included_dirs': normalize_exclude_paths(args.include_dirs) or [],
             'reach_skip_cache': args.reach_skip_cache,
             'reach_min_severity': args.reach_min_severity,
             'reach_output_file': args.reach_output_file,
@@ -163,13 +364,60 @@ class CliConfig:
             'reach_additional_params': args.reach_additional_params,
             'only_facts_file': args.only_facts_file,
             'reach_use_only_pregenerated_sboms': args.reach_use_only_pregenerated_sboms,
+            'reach_continue_on_analysis_errors': args.reach_continue_on_analysis_errors,
+            'reach_continue_on_install_errors': args.reach_continue_on_install_errors,
+            'reach_continue_on_missing_lock_files': args.reach_continue_on_missing_lock_files,
+            'reach_continue_on_no_source_files': args.reach_continue_on_no_source_files,
+            'reach_debug': args.reach_debug,
+            'reach_disable_external_tool_checks': args.reach_disable_external_tool_checks,
+            'reach_disable_dependency_downloads': args.reach_disable_dependency_downloads,
             'max_purl_batch_size': args.max_purl_batch_size,
+            'enable_commit_status': args.enable_commit_status,
+            'legal': args.legal or args.legal_format == "fossa",
+            'legal_format': args.legal_format,
+            'config_file': args.config_file,
             'version': __version__
         }
-        try:
-            config_args["excluded_ecosystems"] = json.loads(config_args["excluded_ecosystems"].replace("'", '"'))
-        except json.JSONDecodeError:
-            logging.error(f"Unable to parse excluded_ecosystems: {config_args['excluded_ecosystems']}")
+
+        if config_args['legal']:
+            config_args['generate_license'] = True
+            if not config_args['json_file']:
+                config_args['json_file'] = "socket-report.json"
+            if not config_args['summary_file']:
+                config_args['summary_file'] = "socket-summary.txt"
+            if not config_args['report_link_file']:
+                config_args['report_link_file'] = "socket-report-link.txt"
+            if not config_args['sbom_file']:
+                config_args['sbom_file'] = "socket-sbom.json"
+            if config_args['license_file_name'] == "license_output.json":
+                config_args['license_file_name'] = "socket-license.json"
+
+        if config_args['legal_format'] == "fossa":
+            if not args.json_file:
+                config_args['json_file'] = "fossa-analyze.json"
+            if not args.summary_file:
+                config_args['summary_file'] = "fossa-test.txt"
+            if not args.report_link_file:
+                config_args['report_link_file'] = "fossa-link.txt"
+            if not args.license_file_name:
+                # argparse always provides a default, so this branch is defensive only
+                config_args['license_file_name'] = "fossa-sbom.json"
+            elif args.license_file_name == "license_output.json":
+                config_args['license_file_name'] = "fossa-sbom.json"
+            if not args.sbom_file:
+                # FOSSA's "SBOM" artifact is the attribution payload; suppress the extra Socket-only SBOM file by default.
+                config_args['sbom_file'] = None
+        excluded_ecosystems = config_args["excluded_ecosystems"]
+        if isinstance(excluded_ecosystems, list):
+            config_args["excluded_ecosystems"] = excluded_ecosystems
+        elif isinstance(excluded_ecosystems, str):
+            try:
+                config_args["excluded_ecosystems"] = json.loads(excluded_ecosystems.replace("'", '"'))
+            except json.JSONDecodeError:
+                logging.error(f"Unable to parse excluded_ecosystems: {excluded_ecosystems}")
+                exit(1)
+        else:
+            logging.error(f"Unable to parse excluded_ecosystems: {excluded_ecosystems}")
             exit(1)
         # Build Slack plugin config, merging CLI arg with env config
         slack_config = get_plugin_config_from_env("SOCKET_SLACK")
@@ -199,6 +447,29 @@ class CliConfig:
         if args.workspace_name and not args.sub_paths:
             logging.error("--workspace-name requires --sub-path to be specified")
             exit(1)
+
+        # argparse only enforces the mutually exclusive group for real CLI args;
+        # this also catches both values arriving via a --config file.
+        if args.base_scan_id and args.base_commit_sha:
+            logging.error("--base-scan-id and --base-commit-sha are mutually exclusive")
+            exit(1)
+
+        if args.sarif_scope == "full" and not args.reach:
+            logging.error("--sarif-scope full requires --reach to be specified")
+            exit(1)
+        if args.sarif_reachability != "all" and not args.reach:
+            logging.error("--sarif-reachability requires --reach to be specified")
+            exit(1)
+        if args.sarif_grouping == "alert" and args.sarif_scope != "full":
+            logging.error("--sarif-grouping alert currently requires --sarif-scope full")
+            exit(1)
+        if args.sarif_reachability in ("potentially", "reachable-or-potentially") and args.sarif_scope != "full":
+            logging.error("--sarif-reachability potentially/reachable-or-potentially requires --sarif-scope full")
+            exit(1)
+
+        # Validate --exclude-paths patterns up front (mirrors Node's assertValidExcludePaths).
+        if config_args.get("exclude_paths"):
+            validate_exclude_paths(config_args["exclude_paths"])
 
         # Validate that only_facts_file requires reach
         if args.only_facts_file and not args.reach:
@@ -234,6 +505,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
     # Authentication
     auth_group = parser.add_argument_group('Authentication')
     auth_group.add_argument(
+        "--config",
+        dest="config_file",
+        metavar="<path>",
+        help="Path to JSON/TOML file with default CLI options. CLI flags take precedence."
+    )
+    auth_group.add_argument(
         "--api-token",
         dest="api_token",
         metavar="<token>",
@@ -255,6 +532,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
         required=False
     )
     repo_group.add_argument(
+        "--workspace",
+        metavar="<string>",
+        help="The workspace in the Socket Organization that the repository is in to associate with the full scan.",
+        required=False
+    )
+    repo_group.add_argument(
         "--repo-is-public",
         dest="repo_is_public",
         action="store_true",
@@ -272,8 +555,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--integration",
         choices=INTEGRATION_TYPES,
         metavar="<type>",
-        help="Integration type of api, github, gitlab, azure, or bitbucket. Defaults to api",
-        default="api"
+        help=(
+            "Integration type of api, github, gitlab, azure, or bitbucket. "
+            "Defaults to api; --scm github/gitlab implies the matching integration "
+            "when this option is omitted"
+        ),
+        default=argparse.SUPPRESS
     )
     integration_group.add_argument(
         "--owner",
@@ -288,13 +575,17 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--pr-number",
         dest="pr_number",
         metavar="<number>",
-        help="Pull request number",
-        default="0"
+        help=(
+            "Pull request number. Auto-detected in supported CI environments when omitted; "
+            "pass 0 explicitly to disable detection"
+        ),
+        default=argparse.SUPPRESS
     )
     pr_group.add_argument(
         "--pr_number",
         dest="pr_number",
-        help=argparse.SUPPRESS
+        help=argparse.SUPPRESS,
+        default=argparse.SUPPRESS
     )
     pr_group.add_argument(
         "--commit-message",
@@ -324,6 +615,27 @@ def create_argument_parser() -> argparse.ArgumentParser:
         metavar="<name>",
         help="Committer for the commit (comma separated)",
         nargs="*"
+    )
+    base_scan_group = pr_group.add_mutually_exclusive_group()
+    base_scan_group.add_argument(
+        "--base-scan-id",
+        dest="base_scan_id",
+        metavar="<id>",
+        default=None,
+        help="Full scan ID to diff the new scan against, overriding the repository's "
+             "head scan as the baseline. Mutually exclusive with --base-commit-sha."
+    )
+    base_scan_group.add_argument(
+        "--base-commit-sha",
+        dest="base_commit_sha",
+        metavar="<sha>",
+        default=None,
+        help="Commit SHA to diff the new scan against, overriding the repository's head "
+             "scan as the baseline. The CLI uses the most recent matching full scan, or "
+             "the nearest scanned first-parent ancestor within 100 local commits when "
+             "the commit itself was not scanned. Also sets the range changed-file "
+             "detection reads, so a manifest changed anywhere between this commit and "
+             "HEAD is seen. Mutually exclusive with --base-scan-id."
     )
 
     # Path and File options
@@ -397,6 +709,26 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="List of ecosystems to exclude from analysis (JSON array string)"
     )
 
+    path_group.add_argument(
+        "--exclude-paths",
+        dest="exclude_paths",
+        metavar="<list>",
+        help="Comma-separated paths/globs to exclude from BOTH manifest discovery and "
+             "reachability analysis (e.g. 'tests/**,packages/legacy,*.spec.ts'). "
+             "Supersedes --reach-exclude-paths."
+    )
+
+    path_group.add_argument(
+        "--include-dirs",
+        dest="include_dirs",
+        metavar="<list>",
+        help="Comma-separated directory names that are excluded from manifest discovery by "
+             "default but should be scanned (e.g. 'build,dist'). Names are matched against any "
+             "path segment, mirroring the default exclude list. Defaults excluded: "
+             "node_modules, bower_components, jspm_packages, __pycache__, .venv, venv, build, "
+             "dist, .tox, .mypy_cache, .pytest_cache, *.egg-info, vendor."
+    )
+
     # Branch and Scan Configuration
     config_group = parser.add_argument_group('Branch and Scan Configuration')
     config_group.add_argument(
@@ -416,6 +748,19 @@ def create_argument_parser() -> argparse.ArgumentParser:
         dest="pending_head",
         action="store_true",
         help="If true, the new scan will be set as the branch's head scan"
+    )
+    config_group.add_argument(
+        "--ignore-authorization",
+        dest="ignore_authorization",
+        choices=["enforce", "strict", "off"],
+        default="enforce",
+        help=(
+            "Who may suppress alerts with @SocketSecurity ignore comments. "
+            "'enforce' (default) requires write access, and honors the command with "
+            "a warning when the provider cannot report the commenter's access. "
+            "'strict' rejects the command in that case instead. "
+            "'off' honors a command from any commenter."
+        )
     )
     config_group.add_argument(
         "--pending_head",
@@ -456,10 +801,44 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Output in JSON format"
     )
     output_group.add_argument(
+        "--json-file",
+        dest="json_file",
+        metavar="<path>",
+        help="Output file path for JSON report"
+    )
+    output_group.add_argument(
         "--enable-sarif",
         dest="enable_sarif",
         action="store_true",
         help="Enable SARIF output of results instead of table or JSON format"
+    )
+    output_group.add_argument(
+        "--sarif-file",
+        dest="sarif_file",
+        metavar="<path>",
+        default=None,
+        help="Output file path for SARIF report (implies --enable-sarif)"
+    )
+    output_group.add_argument(
+        "--sarif-scope",
+        dest="sarif_scope",
+        choices=["diff", "full"],
+        default="diff",
+        help="Scope SARIF output to diff alerts (default) or full reachability facts data (requires --reach)"
+    )
+    output_group.add_argument(
+        "--sarif-grouping",
+        dest="sarif_grouping",
+        choices=["instance", "alert"],
+        default="instance",
+        help="SARIF result grouping mode: instance (default) or alert (full scope only)"
+    )
+    output_group.add_argument(
+        "--sarif-reachability",
+        dest="sarif_reachability",
+        choices=["all", "reachable", "potentially", "reachable-or-potentially"],
+        default="all",
+        help="Reachability filter for SARIF output (requires --reach when not 'all')"
     )
     output_group.add_argument(
         "--enable-gitlab-security",
@@ -473,6 +852,18 @@ def create_argument_parser() -> argparse.ArgumentParser:
         metavar="<path>",
         default="gl-dependency-scanning-report.json",
         help="Output file path for GitLab Security report (default: gl-dependency-scanning-report.json)"
+    )
+    output_group.add_argument(
+        "--summary-file",
+        dest="summary_file",
+        metavar="<path>",
+        help="Output file path for a plain-text summary report"
+    )
+    output_group.add_argument(
+        "--report-link-file",
+        dest="report_link_file",
+        metavar="<path>",
+        help="Output file path for the Socket report link"
     )
     output_group.add_argument(
         "--disable-overview",
@@ -490,7 +881,12 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--exclude-license-details",
         dest="exclude_license_details",
         action="store_true",
-        help="Exclude license details from the diff report (boosts performance for large repos)"
+        help=(
+            "Exclude license details from the dashboard report URL. "
+            "As of 2.4.0 the internal diff request always omits license details "
+            "(they were unused there and bloated large-repo responses), so this "
+            "flag now only affects the report link, not diff performance."
+        )
     )
     output_group.add_argument(
         "--max-purl-batch-size",
@@ -512,6 +908,18 @@ def create_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS
     )
+    output_group.add_argument(
+        "--enable-commit-status",
+        dest="enable_commit_status",
+        action="store_true",
+        help="Report scan result as a commit status on GitLab (requires GitLab SCM)"
+    )
+    output_group.add_argument(
+        "--enable_commit_status",
+        dest="enable_commit_status",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
 
     # Plugin Configuration
     plugin_group = parser.add_argument_group('Plugin Configuration')
@@ -528,7 +936,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--ignore-commit-files",
         dest="ignore_commit_files",
         action="store_true",
-        help="Ignore commit files"
+        help="Compare against the baseline regardless of which files changed, scanning every manifest in the target path"
     )
     advanced_group.add_argument(
         "--ignore_commit_files",
@@ -540,13 +948,50 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--disable-blocking",
         dest="disable_blocking",
         action="store_true",
-        help="Disable blocking mode"
+        help=(
+            "Non-blocking CI mode: always exit 0, even when blocking alerts are present "
+            "(including with --strict-blocking), on uncaught errors, or on Socket API failures. "
+            "Findings and errors are still logged. Overrides --strict-blocking."
+        ),
     )
     advanced_group.add_argument(
         "--disable_blocking",
         dest="disable_blocking",
         action="store_true",
         help=argparse.SUPPRESS
+    )
+    advanced_group.add_argument(
+        "--disable-ignore",
+        dest="disable_ignore",
+        action="store_true",
+        help="Disable support for @SocketSecurity ignore commands in PR comments. "
+             "Alerts cannot be suppressed via comments when this flag is set."
+    )
+    advanced_group.add_argument(
+        "--disable_ignore",
+        dest="disable_ignore",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+    log_upload_group = advanced_group.add_mutually_exclusive_group()
+    log_upload_group.add_argument(
+        "--upload-logs",
+        dest="upload_logs",
+        action="store_const",
+        const=True,
+        help="Upload the CLI's log output to the Socket backend for this run. "
+             "When set, the CLI registers the run with share_logs=true and streams "
+             "its log records in 5s batches. Default off. Mutually exclusive with "
+             "--no-upload-logs."
+    )
+    log_upload_group.add_argument(
+        "--no-upload-logs",
+        dest="upload_logs",
+        action="store_const",
+        const=False,
+        help="Explicitly opt out of uploading CLI logs to the Socket backend, even "
+             "when an org-level override would otherwise enable it. Mutually "
+             "exclusive with --upload-logs."
     )
     advanced_group.add_argument(
         "--strict-blocking",
@@ -574,9 +1019,37 @@ def create_argument_parser() -> argparse.ArgumentParser:
         required=False
     )
     advanced_group.add_argument(
+        "--exit-code-on-api-error",
+        dest="exit_code_on_api_error",
+        type=int,
+        default=3,
+        metavar="<int>",
+        help=(
+            "Exit code to use when the CLI fails on an API or infrastructure error "
+            "(timeout, network failure, unexpected exception). Default: 3. Useful for "
+            "distinguishing infrastructure failures from security findings (exit 1) in "
+            "CI -- e.g. set to a Buildkite soft_fail code. NOTE: --disable-blocking "
+            "forces exit 0 for ALL outcomes and therefore overrides this flag; do not "
+            "combine the two if you want the custom code to take effect."
+        )
+    )
+    advanced_group.add_argument(
         "--allow-unverified",
         action="store_true",
         help="Disable SSL certificate verification for API requests"
+    )
+    advanced_group.add_argument(
+        "--legal",
+        dest="legal",
+        action="store_true",
+        help="Enable legal/compliance-friendly defaults and file outputs"
+    )
+    advanced_group.add_argument(
+        "--legal-format",
+        dest="legal_format",
+        choices=["socket", "fossa"],
+        default="socket",
+        help="Select the legal artifact format. 'socket' keeps Socket-native outputs; 'fossa' emits compatibility-shaped JSON artifacts."
     )
     config_group.add_argument(
         "--include-module-folders",
@@ -597,22 +1070,34 @@ def create_argument_parser() -> argparse.ArgumentParser:
     reachability_group.add_argument(
         "--reach-version",
         dest="reach_version",
-        metavar="<version>",
-        help="Specific version of @coana-tech/cli to use (e.g., '1.2.3')"
+        metavar="<version|latest>",
+        help="Version of the Coana CLI to use. Defaults to the version pinned to this CLI "
+             "release; pass 'latest' to always use the newest published version (opt-in "
+             "auto-update), or an explicit version (e.g. '1.2.3') to pin it."
     )
+    reachability_group.add_argument(
+        "--reach-analysis-timeout",
+        dest="reach_analysis_timeout",
+        metavar="<duration>",
+        help="Set the timeout for each reachability analysis run, e.g. 90s, 10m or 1h. (default: 10m)"
+    )
+    # Backwards-compatible alias for the pre-alignment name. Kept working, hidden from help.
     reachability_group.add_argument(
         "--reach-timeout",
         dest="reach_analysis_timeout",
-        type=int,
-        metavar="<seconds>",
-        help="Timeout for reachability analysis in seconds"
+        help=argparse.SUPPRESS
     )
+    reachability_group.add_argument(
+        "--reach-analysis-memory-limit",
+        dest="reach_analysis_memory_limit",
+        metavar="<size>",
+        help="Set the memory limit for each reachability analysis run, e.g. 512MB or 8GB. (default: 8GB)"
+    )
+    # Backwards-compatible alias for the pre-alignment name. Kept working, hidden from help.
     reachability_group.add_argument(
         "--reach-memory-limit",
         dest="reach_analysis_memory_limit",
-        type=int,
-        metavar="<mb>",
-        help="Memory limit for reachability analysis in MB"
+        help=argparse.SUPPRESS
     )
     reachability_group.add_argument(
         "--reach-ecosystems",
@@ -624,7 +1109,8 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--reach-exclude-paths",
         dest="reach_exclude_paths",
         metavar="<list>",
-        help="Paths to exclude from reachability analysis (comma-separated)"
+        help="[DEPRECATED: use --exclude-paths] Paths to exclude from reachability analysis "
+             "(comma-separated). Still honored and unioned with --exclude-paths."
     )
     reachability_group.add_argument(
         "--reach-min-severity",
@@ -666,7 +1152,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         "--reach-lazy-mode",
         dest="reach_lazy_mode",
         action="store_true",
-        help="Enable lazy mode for reachability analysis. This is an experimental feature for improving performance"
+        help=argparse.SUPPRESS  # Deprecated, kept for backwards compatibility (no-op)
     )
     reachability_group.add_argument(
         "--reach-output-file",
@@ -680,7 +1166,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         dest="reach_concurrency",
         type=int,
         metavar="<number>",
-        help="Concurrency level for reachability analysis (must be >= 1)"
+        help="Concurrency level for reachability analysis (must be >= 1; defaults to the coana CLI's own default, currently 1)"
     )
     reachability_group.add_argument(
         "--reach-additional-params",
@@ -700,6 +1186,52 @@ def create_argument_parser() -> argparse.ArgumentParser:
         dest="reach_use_only_pregenerated_sboms",
         action="store_true",
         help="When using this option, the scan is created based only on pre-generated CDX and SPDX files in your project. (requires --reach)"
+    )
+    reachability_group.add_argument(
+        "--reach-continue-on-analysis-errors",
+        dest="reach_continue_on_analysis_errors",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+    reachability_group.add_argument(
+        "--reach-continue-on-install-errors",
+        dest="reach_continue_on_install_errors",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+    reachability_group.add_argument(
+        "--reach-continue-on-missing-lock-files",
+        dest="reach_continue_on_missing_lock_files",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+    reachability_group.add_argument(
+        "--reach-continue-on-no-source-files",
+        dest="reach_continue_on_no_source_files",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+    reachability_group.add_argument(
+        "--reach-debug",
+        dest="reach_debug",
+        action="store_true",
+        help="Enable debug output for the reachability analysis (passes --debug to the coana CLI). "
+             "Independent of the global --enable-debug flag."
+    )
+    reachability_group.add_argument(
+        "--reach-disable-external-tool-checks",
+        dest="reach_disable_external_tool_checks",
+        action="store_true",
+        help="Disable coana's external tool availability checks during reachability analysis "
+             "(passes --disable-external-tool-checks to the coana CLI)."
+    )
+    reachability_group.add_argument(
+        "--reach-disable-dependency-downloads",
+        dest="reach_disable_dependency_downloads",
+        action="store_true",
+        help="Only analyze dependencies that are already installed (e.g. in the project's .venv, "
+             "vendor directory or module cache); missing ones count as install failures "
+             "(passes --disable-dependency-downloads to the coana CLI)."
     )
 
     parser.add_argument(

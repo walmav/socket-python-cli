@@ -1,46 +1,134 @@
 name: Version Check
 on:
+  # Unfiltered: a required check behind a paths filter never reports on a
+  # pull request that misses the filter, which blocks the merge.
   pull_request:
     types: [opened, synchronize, ready_for_review]
-    paths:
-      - 'socketsecurity/**'
-      - 'setup.py'
-      - 'pyproject.toml'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
 
 jobs:
   check_version:
+    # Skip on Dependabot PRs: they bump dependencies (touching uv.lock /
+    # pyproject.toml) without bumping the app version, so the increment check
+    # would always fail. App-version bumps come from maintainer PRs.
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # Fetch all history for all branches
+          persist-credentials: false
 
       - name: Check version increment
         id: version_check
         run: |
+          python -m pip install --upgrade pip
+          pip install packaging
+
           # Get version from current PR
           PR_VERSION=$(grep -o "__version__.*" socketsecurity/__init__.py | awk '{print $3}' | tr -d "'")
           echo "PR_VERSION=$PR_VERSION" >> $GITHUB_ENV
 
           # Get version from main branch
-          git checkout origin/main
-          MAIN_VERSION=$(grep -o "__version__.*" socketsecurity/__init__.py | awk '{print $3}' | tr -d "'")
+          MAIN_VERSION=$(git show origin/main:socketsecurity/__init__.py | grep -o "__version__.*" | awk '{print $3}' | tr -d "'")
           echo "MAIN_VERSION=$MAIN_VERSION" >> $GITHUB_ENV
 
-          # Compare versions using Python
-          python3 -c "
+          export PR_VERSION
+          export MAIN_VERSION
+
+          # Compare against the latest published PyPI release.
+          python3 <<'PY'
+          import json
+          import os
+          import tomllib
+          import urllib.request
           from packaging import version
-          pr_ver = version.parse('${PR_VERSION}')
-          main_ver = version.parse('${MAIN_VERSION}')
-          if pr_ver <= main_ver:
-              print(f'❌ Version must be incremented! Main: {main_ver}, PR: {pr_ver}')
-              exit(1)
-          print(f'✅ Version properly incremented from {main_ver} to {pr_ver}')
-          "
+
+          pr_ver = version.parse(os.environ["PR_VERSION"])
+          main_ver = version.parse(os.environ["MAIN_VERSION"])
+
+          with open("pyproject.toml", "rb") as fh:
+              pyproject_ver = version.parse(tomllib.load(fh)["project"]["version"])
+
+          # The version is two hand-maintained literals with nothing deriving one
+          # from the other: pyproject.toml is what actually gets published, and
+          # socketsecurity/__init__.py is what the CLI reports as its User-Agent.
+          # Every comparison below reads only __init__.py, so bumping that alone
+          # would pass this job and then publish under the old number -- caught
+          # late, by twine rejecting an existing file, after the merge. Require
+          # the two to agree before comparing anything. (uv.lock carries a third
+          # copy, but uv derives it and `uv lock --locked` in python-tests
+          # already fails when it drifts.)
+          if pr_ver != pyproject_ver:
+              print(
+                  f"❌ Version mismatch inside the PR: pyproject.toml is "
+                  f"{pyproject_ver}, socketsecurity/__init__.py is {pr_ver}. "
+                  f"Bump both."
+              )
+              raise SystemExit(1)
+
+          with urllib.request.urlopen("https://pypi.org/pypi/socketsecurity/json") as response:
+              pypi_data = json.load(response)
+
+          published_versions = []
+          for raw in pypi_data.get("releases", {}).keys():
+              parsed = version.parse(raw)
+              if not parsed.is_prerelease and not parsed.is_devrelease:
+                  published_versions.append(parsed)
+
+          pypi_ver = max(published_versions) if published_versions else version.parse("0.0.0")
+
+          # The only hard requirement is that the version is ahead of what is
+          # actually released. Treating main's version as a second floor breaks
+          # the legitimate case where several PRs share one unreleased release:
+          # the first bumps main to the new version and the rest ride it without
+          # bumping again, which is what keeps them under a single changelog
+          # header. Main is therefore only a floor when this PR moves the
+          # version -- a change to it must go forwards, never backwards.
+          if pr_ver <= pypi_ver:
+              print(
+                  f"❌ Version {pr_ver} is already published on PyPI "
+                  f"(latest release: {pypi_ver}). Bump it."
+              )
+              raise SystemExit(1)
+
+          if pr_ver < main_ver:
+              print(
+                  f"❌ Version moves backwards: main is {main_ver}, PR is {pr_ver}."
+              )
+              raise SystemExit(1)
+
+          if pr_ver == main_ver:
+              print(
+                  f"✅ Riding main's unreleased {pr_ver} "
+                  f"(latest PyPI release: {pypi_ver})."
+              )
+          else:
+              print(
+                  f"✅ Version properly incremented. "
+                  f"Main: {main_ver}, PyPI: {pypi_ver}, PR: {pr_ver}"
+              )
+          PY
+
+      - name: Require uv.lock update when pyproject changes
+        run: |
+          CHANGED_FILES="$(git diff --name-only origin/main...HEAD)"
+
+          if echo "$CHANGED_FILES" | grep -qx 'pyproject.toml'; then
+            if ! echo "$CHANGED_FILES" | grep -qx 'uv.lock'; then
+              echo "❌ pyproject.toml changed, but uv.lock was not updated."
+              echo "Run 'uv lock' and commit uv.lock with the version bump."
+              exit 1
+            fi
+          fi
 
       - name: Manage PR Comment
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
         env:
           MAIN_VERSION: ${{ env.MAIN_VERSION }}
           PR_VERSION: ${{ env.PR_VERSION }}

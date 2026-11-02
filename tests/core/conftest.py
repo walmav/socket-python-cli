@@ -87,6 +87,22 @@ def stream_diff_response(data_dir, load_json):
     })
 
 
+@pytest.fixture
+def diff_scan_get_response(data_dir, load_json):
+    """GET /orgs/{org}/diff-scans/{id} response built from the stream_diff fixture.
+
+    The diff-scans endpoint returns the same artifact shape as the legacy
+    streaming diff, wrapped in a diff_scan object.
+    """
+    json_data = load_json(data_dir / "fullscans" / "diff" / "stream_diff.json")
+    return {
+        "diff_scan": {
+            "id": "diff-scan-123",
+            "artifacts": json_data["data"]["artifacts"],
+        }
+    }
+
+
 
 
 
@@ -138,32 +154,44 @@ def mock_sdk_with_responses(
     new_scan_metadata,
     new_scan_stream,
     stream_diff_response,
+    diff_scan_get_response,
     create_full_scan_response,
 ):
     sdk = mock_socket_sdk.return_value
+
+    sdk.org.get.return_value = {
+        "organizations": {
+            "test-org-id": {"slug": "test-org"}
+        }
+    }
+    sdk.licensemetadata.post.return_value = [{"text": ""}]
 
     # Simple returns
     sdk.fullscans.post.return_value = create_full_scan_response
 
     # Argument-based returns
-    sdk.repos.repo.side_effect = lambda org_slug, repo_slug: {
+    sdk.repos.repo.side_effect = lambda org_slug, repo_slug, **kwargs: {
         "test": repo_info_response,
         "error": repo_info_error,
         "no-head": repo_info_no_head,
     }[repo_slug]
 
-    sdk.fullscans.metadata.side_effect = lambda org_slug, scan_id: {
+    sdk.fullscans.metadata.side_effect = lambda org_slug, scan_id, **kwargs: {
         "head": head_scan_metadata,
         "new": new_scan_metadata,
     }[scan_id]
 
-    sdk.fullscans.stream.side_effect = lambda org_slug, scan_id: {
+    sdk.fullscans.stream.side_effect = lambda org_slug, scan_id, **kwargs: {
         "head": head_scan_stream,
         "new": new_scan_stream,
     }[scan_id]
 
     sdk.fullscans.stream_diff.side_effect = (
-        lambda org_slug, head_id, new_id: stream_diff_response
+        lambda org_slug, head_id, new_id, **kwargs: stream_diff_response
     )
+
+    # Diff-scans endpoints (primary scan-comparison path)
+    sdk.diffscans.create_from_ids.return_value = {"diff_scan": {"id": "diff-scan-123"}}
+    sdk.diffscans.get.return_value = diff_scan_get_response
 
     return sdk

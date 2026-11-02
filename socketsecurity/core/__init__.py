@@ -1,36 +1,38 @@
+import atexit
+import copy
+import fnmatch
+import importlib
+import json
 import logging
 import os
+import random
+import re
+import shutil
 import sys
 import tarfile
 import tempfile
 import time
-import json
 from dataclasses import asdict
-from pathlib import Path, PurePath
-from typing import Dict, List, Tuple, Set, TYPE_CHECKING, Optional
+from pathlib import PurePath
+from typing import TYPE_CHECKING, Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
 
 if TYPE_CHECKING:
     from socketsecurity.config import CliConfig
+from git import Repo
 from socketdev import socketdev
 from socketdev.exceptions import APIFailure
-from socketdev.fullscans import FullScanParams, SocketArtifact
+from socketdev.fullscans import DiffArtifacts, FullScanParams, SocketArtifact
 from socketdev.org import Organization
 from socketdev.repos import RepositoryInfo
-import copy
-from socketsecurity import __version__, USER_AGENT
-from socketsecurity.core.classes import (
-    Alert,
-    Diff,
-    FullScan,
-    Issue,
-    Package,
-    Purl
-)
+
+from socketsecurity import USER_AGENT, __version__
+from socketsecurity.core.classes import Alert, Diff, FullScan, Issue, Package, Purl
 from socketsecurity.core.exceptions import APIResourceNotFound
+
+from .resource_utils import check_file_count_against_ulimit
 from .socket_config import SocketConfig
 from .utils import socket_globs
-from .resource_utils import check_file_count_against_ulimit
-import importlib
+
 logging_std = importlib.import_module("logging")
 
 
@@ -43,6 +45,147 @@ __all__ = [
 
 version = __version__
 log = logging.getLogger("socketdev")
+
+_ALERT_TYPE_TITLE_OVERRIDES = {
+    "gptDidYouMean": "Possible typosquat attack (GPT)",
+}
+
+_HUMANIZE_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+# How many full scans to request when resolving a diff baseline. The newest scan is
+# usually the one we want, but temporary scans have to be skipped (see
+# Core.newest_persisted_scan_id), so a single result is not enough.
+SCAN_LOOKUP_PAGE_SIZE = 10
+
+# Bounds on the search for a scanned ancestor when the requested baseline commit has
+# no full scan of its own. Full-scan listing pages are matched against bounded local
+# history, so the local walk cannot grow without limit.
+ANCESTOR_SCAN_LOOKUP_LIMIT = 100
+ANCESTOR_WALK_MAX_DEPTH = 100
+
+# Reachability facts-file upload compression.
+#
+# The Socket full-scan endpoint transparently brotli-decompresses any multipart part
+# whose basename is exactly ``.socket.facts.json.br`` and stores it as plain
+# ``.socket.facts.json``. Compressing the facts file on upload keeps it well under the
+# server's per-file size cap (a ~262 MB facts file compresses to roughly 15-30 MB),
+# which is required for large full application reachability scans to succeed.
+#
+# The server matches the *exact* name ``.socket.facts.json.br``, so we only compress
+# files whose basename is exactly ``.socket.facts.json`` (a custom ``--reach-output-file``
+# name would not be decompressed server-side, so it is left as a plain upload).
+SOCKET_FACTS_FILENAME = ".socket.facts.json"
+SOCKET_FACTS_BROTLI_FILENAME = ".socket.facts.json.br"
+# Brotli quality (0-11); 5 is a good speed/ratio tradeoff for large JSON payloads.
+SOCKET_FACTS_BROTLI_QUALITY = 5
+# Largest brotli window (2**24 bytes); improves the ratio on large facts files.
+SOCKET_FACTS_BROTLI_LGWIN = 24
+# Stream the facts file in 1 MiB chunks so large files aren't held fully in memory.
+SOCKET_FACTS_BROTLI_CHUNK_SIZE = 1024 * 1024
+
+# Placeholder facts document (see empty_head_scan_file). A zero-byte file does not parse,
+# and the API answers an unparseable facts file with the marker artifact below.
+SOCKET_FACTS_EMPTY_DOCUMENT = '{"components": []}'
+
+# Synthetic artifact the API adds when an uploaded ``.socket.facts.json`` could not be
+# parsed. A diagnostic, not a dependency, so it is dropped from scan results and reported
+# as a warning instead.
+INVALID_FACTS_MARKER_TYPE = "generic"
+INVALID_FACTS_MARKER_NAME = "invalid-socket-facts"
+
+# Full application reachability finalize retry policy. The finalize call links the reachability
+# scan to the full scan and can fail transiently (network/API blips); a few backoff retries make it robust.
+TIER1_FINALIZE_MAX_ATTEMPTS = 3
+TIER1_FINALIZE_BACKOFF_SECONDS = 1.0
+
+# Full scan upload retry policy. An upload can fail transiently at the gateway/connection
+# level (an HTTP 502/503/504/408, a dropped or reset connection, or a client-side timeout)
+# without the server having created the scan; the SDK classifies those failures via
+# APIFailure.is_transient_error() (socketdev>=3.3.0). In these failure modes no scan was
+# created, so a retry does not duplicate one. (A duplicate is possible only if a gateway
+# timeout races a request the server later completes; that is benign - the retried scan
+# supersedes the orphaned one, same as running the CLI twice.)
+#
+# Each schedule entry is the wait before the next attempt once the current one fails (plus
+# a little jitter so a fleet of CI jobs hitting the same failure doesn't retry in
+# lock-step); the final None means the last attempt's failure is re-raised, not retried.
+FULL_SCAN_UPLOAD_BACKOFF_SCHEDULE_SECONDS = (10.0, 30.0, None)
+FULL_SCAN_UPLOAD_MAX_ATTEMPTS = len(FULL_SCAN_UPLOAD_BACKOFF_SCHEDULE_SECONDS)
+FULL_SCAN_UPLOAD_BACKOFF_JITTER_SECONDS = 2.0
+
+# Statuses that mean the request is too large to process. Scan metadata travels in the
+# query string of the full-scan POST, while manifests travel in its multipart body. A
+# 413 can refer to either part; 414 points to the URL, and some proxies report 431 when
+# the encoded request target exceeds their header limit. None are transient.
+REQUEST_TOO_LARGE_STATUS_CODES = (413, 414, 431)
+
+# Diff-scan polling policy. The legacy scan comparison (fullscans.stream_diff) holds a
+# single HTTP connection open, fully idle, while the backend computes the diff; network
+# middleboxes with TCP idle timeouts (notably Azure NAT gateways, which default to
+# 4 minutes) kill that connection with a RST, surfacing as an intermittent
+# ConnectionResetError on large scans. The diff-scans flow instead creates a
+# diff-scan resource and polls its cached endpoint with short bounded requests: the API
+# answers 202 while the comparison is still computing and 200 with the result once it is
+# ready, so no connection is ever idle long enough to be reaped.
+#
+# Each poll consumes 1 unit of API quota, so the interval backs off toward
+# DIFF_SCAN_POLL_MAX_INTERVAL_SECONDS to stay quota-friendly on comparisons that take
+# minutes to compute. The timeout is a backstop against a diff scan that never
+# completes; on expiry (or any other failure of this flow) the caller falls back to the
+# legacy streaming comparison rather than failing the scan outright.
+DIFF_SCAN_POLL_INITIAL_INTERVAL_SECONDS = 5.0
+DIFF_SCAN_POLL_MAX_INTERVAL_SECONDS = 10.0
+DIFF_SCAN_POLL_BACKOFF_MULTIPLIER = 1.5
+DIFF_SCAN_POLL_TIMEOUT_SECONDS = 30 * 60.0
+
+# Temp dirs holding placeholder facts files (see Core.empty_head_scan_file). Call sites unlink
+# the file itself once the upload finishes; the now-empty directory is removed at process exit
+# so a run that raises mid-scan doesn't leak one.
+_PLACEHOLDER_FACTS_DIRS: List[str] = []
+
+
+@atexit.register
+def _cleanup_placeholder_facts_dirs() -> None:
+    for placeholder_dir in _PLACEHOLDER_FACTS_DIRS:
+        shutil.rmtree(placeholder_dir, ignore_errors=True)
+
+
+def _humanize_alert_type(alert_type: str) -> str:
+    """Convert a camelCase/PascalCase alert type into a Title-Cased label.
+
+    Used as a last-resort fallback when the SDK does not have metadata for an
+    alert type and there is no explicit override. Adjacent capitals are kept
+    together so acronyms like 'SQL' survive ('SQLInjection' -> 'SQL Injection').
+    """
+    if not alert_type:
+        return ""
+    parts = _HUMANIZE_BOUNDARY.split(alert_type)
+    return " ".join(part[:1].upper() + part[1:] for part in parts if part)
+
+
+class ManifestPatterns(NamedTuple):
+    """Manifest patterns prepared once per scan root, case-folded for matching.
+
+    The first three fields are the authoritative matchers used by
+    Core._matches_manifest_pattern. The candidate_* fields are a prefilter over
+    basenames alone: a manifest-discovery walk visits every file in the repository
+    but only a few hundred are manifests, so rejecting a name up front avoids
+    building a relative path and running a path match for the rest. The prefilter's
+    globs are pre-compiled into one alternation so the cost per rejected file stays
+    flat as the API's pattern list grows.
+    """
+
+    literal_basenames: Set[str]
+    basename_globs: List[str]
+    path_globs: List[str]
+    candidate_basenames: Set[str]
+    candidate_basename_regex: Optional["re.Pattern"]
+
+    @property
+    def is_empty(self) -> bool:
+        """True when every ecosystem was filtered out, so the walk can be skipped."""
+        return not (self.literal_basenames or self.basename_globs or self.path_globs)
+
 
 class Core:
     """Main class for interacting with Socket Security API and processing scan results."""
@@ -65,7 +208,13 @@ class Core:
         self.config = config
         self.sdk = sdk
         self.cli_config = cli_config
+        self._supported_patterns: Optional[Dict] = None
+        org_start_time = time.perf_counter()
         self.set_org_vars()
+        log.info(
+            "Organization initialization completed in "
+            f"{time.perf_counter() - org_start_time:.2f}s"
+        )
 
     def set_org_vars(self) -> None:
         """Sets the main shared configuration variables for organization access."""
@@ -88,25 +237,67 @@ class Core:
             return org_id, organizations[org_id]['slug']
         return None, None
 
-    def get_sbom_data(self, full_scan_id: str) -> List[SocketArtifact]:
-        """Returns the list of SBOM artifacts for a full scan."""
+    def get_sbom_data(self, full_scan_id: str) -> Dict[str, SocketArtifact]:
+        """Returns SBOM artifacts for a full scan keyed by artifact ID."""
         response = self.sdk.fullscans.stream(self.config.org_slug, full_scan_id, use_types=True)
-        artifacts: List[SocketArtifact] = []
         if not response.success:
-            log.debug(f"Failed to get SBOM data for full-scan {full_scan_id}")
-            log.debug(response.message)
-            return {}
+            # Raise instead of returning {} so a failed fetch surfaces as an
+            # API error (exit code 3 by default) rather than empty reports.
+            log.error(f"Failed to get SBOM data for full-scan {full_scan_id}")
+            log.error(response.message)
+            raise APIFailure(
+                f"Failed to get SBOM data for full-scan {full_scan_id}: {response.message}"
+            )
         if not hasattr(response, "artifacts") or not response.artifacts:
-            return artifacts
-        for artifact_id in response.artifacts:
-            artifacts.append(response.artifacts[artifact_id])
+            return {}
+        artifacts = {
+            artifact_id: artifact
+            for artifact_id, artifact in response.artifacts.items()
+            if not Core.is_invalid_facts_marker(artifact)
+        }
+        Core.warn_if_invalid_facts_marker(len(artifacts) != len(response.artifacts))
         return artifacts
 
     def get_sbom_data_list(self, artifacts_dict: Dict[str, SocketArtifact]) -> list[SocketArtifact]:
         """Converts artifacts dictionary to a list."""
         return list(artifacts_dict.values())
 
+    @staticmethod
+    def is_invalid_facts_marker(artifact) -> bool:
+        """True for the API's ``generic/invalid-socket-facts`` unparseable-facts marker.
 
+        Treated as a package it becomes a blocking alert with an empty "Introduced by" and
+        "Manifest File" that no developer can act on, so callers drop it and report the parse
+        failure through ``warn_if_invalid_facts_marker`` instead.
+
+        Matches any version; the API pins it to 1.0.0 but the version carries no meaning.
+
+        Args:
+            artifact: A ``SocketArtifact`` or diff artifact (anything with ``type``/``name``).
+
+        Returns:
+            True if the artifact is the marker rather than a real package.
+        """
+        return (
+            getattr(artifact, "type", None) == INVALID_FACTS_MARKER_TYPE
+            and getattr(artifact, "name", None) == INVALID_FACTS_MARKER_NAME
+        )
+
+    @staticmethod
+    def warn_if_invalid_facts_marker(found: bool) -> None:
+        """Log the parse failure that ``is_invalid_facts_marker`` stands for.
+
+        Dropping the marker silently would hide a real, if non-blocking, problem: the scan ran
+        without the reachability data it was supposed to carry.
+        """
+        if not found:
+            return
+        log.warning(
+            "Socket could not parse the uploaded .socket.facts.json, so reachability facts "
+            "were not applied to this scan. Ignoring the "
+            f"{INVALID_FACTS_MARKER_TYPE}/{INVALID_FACTS_MARKER_NAME} marker returned for it; "
+            "other scan results are unaffected."
+        )
 
     def create_sbom_output(self, diff: Diff) -> dict:
         """Creates CycloneDX output for a given diff."""
@@ -169,6 +360,67 @@ class Core:
             if part in excluded_dirs:
                 return True
         return False
+
+    @staticmethod
+    def _exclude_glob_to_regex(pattern: str) -> str:
+        """Translate a micromatch-style glob into an anchored regex string.
+
+        Mirrors the Node CLI's --exclude-paths matcher (src/commands/scan/exclude-paths.mts):
+        patterns are matched against scan-root-relative POSIX paths, case-sensitively, where
+        ``*`` does NOT cross ``/`` and ``**`` DOES. Patterns are anchored at the scan root, so
+        ``tests`` matches ``tests`` (not ``src/tests``); use ``**/tests`` to match at any depth.
+        """
+        i, n = 0, len(pattern)
+        out = ["^"]
+        while i < n:
+            c = pattern[i]
+            if c == "*":
+                if i + 1 < n and pattern[i + 1] == "*":
+                    if i + 2 < n and pattern[i + 2] == "/":
+                        out.append("(?:[^/]+/)*")  # '**/' -> zero or more path segments
+                        i += 3
+                    else:
+                        out.append(".*")           # '**' at end / before non-slash -> any, incl '/'
+                        i += 2
+                else:
+                    out.append("[^/]*")            # '*' -> within a single path segment
+                    i += 1
+            elif c == "?":
+                out.append("[^/]")
+                i += 1
+            else:
+                out.append(re.escape(c))
+                i += 1
+        out.append("$")
+        return "".join(out)
+
+    @staticmethod
+    def compile_exclude_paths(patterns: Optional[List[str]]) -> List["re.Pattern"]:
+        """Compile --exclude-paths globs into anchored regexes (compiled once per scan).
+
+        Each pattern ``P`` is expanded the way Node feeds fast-glob's ``ignore``: ``P`` (a file-
+        or dir-shaped exact match) plus ``P/**`` (its subtree), unless ``P`` already ends with
+        ``/**``. Validation of the patterns happens earlier, in CliConfig.from_args.
+        """
+        compiled: List["re.Pattern"] = []
+        for raw in patterns or []:
+            p = (raw or "").strip().replace("\\", "/").rstrip("/")
+            if not p:
+                continue
+            globs = [p] if p.endswith("/**") else [p, f"{p}/**"]
+            compiled.extend(re.compile(Core._exclude_glob_to_regex(g)) for g in globs)
+        return compiled
+
+    @staticmethod
+    def path_matches_exclude_regexes(rel_path: str, regexes: List["re.Pattern"]) -> bool:
+        rp = rel_path.replace(os.sep, "/").replace("\\", "/")
+        return any(r.match(rp) for r in regexes)
+
+    @staticmethod
+    def matches_exclude_paths(file_path: str, base_path: str, patterns: List[str]) -> bool:
+        """Convenience matcher (compiles patterns per call); used in tests/ad-hoc checks."""
+        rel_path = os.path.relpath(file_path, base_path).replace(os.sep, "/")
+        return Core.path_matches_exclude_regexes(rel_path, Core.compile_exclude_paths(patterns))
 
     def save_submitted_files_list(self, files: List[str], output_path: str) -> None:
         """
@@ -278,6 +530,112 @@ class Core:
         except Exception as e:
             log.error(f"Failed to save manifest tar.gz to {output_path}: {e}")
 
+    @staticmethod
+    def _prepare_manifest_patterns(
+            patterns: Dict,
+            ecosystems: Optional[List[str]],
+            excluded_ecosystems: List[str]
+    ) -> "ManifestPatterns":
+        """Prepare case-folded manifest patterns for a single filesystem walk.
+
+        Literal basenames are kept in a set for the common fast path. Basename
+        globs and path-shaped globs are kept separately so the latter retain
+        pathlib's path-segment-aware matching behavior. The candidate basename
+        collections are derived here so the walker can reject a file on its name
+        alone; see ManifestPatterns.
+        """
+        included_ecosystems = set(ecosystems) if ecosystems is not None else None
+        excluded = set(excluded_ecosystems)
+        literal_basenames: Set[str] = set()
+        basename_globs: Set[str] = set()
+        path_globs: Set[str] = set()
+
+        for ecosystem, ecosystem_patterns in patterns.items():
+            if included_ecosystems is not None and ecosystem not in included_ecosystems:
+                continue
+            if ecosystem in excluded:
+                continue
+            log.debug(f"Scanning ecosystem: {ecosystem}")
+            for details in ecosystem_patterns.values():
+                original_pattern = details["pattern"]
+                for expanded in Core.expand_brace_pattern(original_pattern):
+                    normalized = expanded.replace("\\", "/").casefold()
+                    if "/" in normalized:
+                        path_globs.add(normalized)
+                    elif any(character in normalized for character in "*?["):
+                        basename_globs.add(normalized)
+                    else:
+                        literal_basenames.add(normalized)
+
+        # PurePath.match compares pattern segments right to left, so a path-shaped glob
+        # can only match a file whose basename matches the glob's final segment. Folding
+        # those final segments into the basename prefilter lets the walk skip the path
+        # match for everything else. A trailing "/" is directory-only under the legacy
+        # rglob behavior, so its empty final segment intentionally admits no files.
+        candidate_basenames = set(literal_basenames)
+        candidate_basename_globs = set(basename_globs)
+        for pattern in path_globs:
+            final_segment = pattern.rsplit("/", 1)[-1]
+            if any(character in final_segment for character in "*?["):
+                candidate_basename_globs.add(final_segment)
+            else:
+                candidate_basenames.add(final_segment)
+
+        return ManifestPatterns(
+            literal_basenames=literal_basenames,
+            basename_globs=sorted(basename_globs),
+            path_globs=sorted(path_globs),
+            candidate_basenames=candidate_basenames,
+            candidate_basename_regex=Core._compile_basename_globs(candidate_basename_globs),
+        )
+
+    @staticmethod
+    def _compile_basename_globs(globs: Set[str]) -> Optional["re.Pattern"]:
+        """Compile basename globs into a single alternation, or None if there are none.
+
+        fnmatch.translate anchors the tail with ``\\Z`` and re.match anchors the head,
+        so each alternative matches exactly what fnmatch.fnmatchcase would.
+        """
+        if not globs:
+            return None
+        return re.compile(
+            "|".join(f"(?:{fnmatch.translate(glob)})" for glob in sorted(globs))
+        )
+
+    @staticmethod
+    def _basename_could_match(normalized_name: str, patterns: "ManifestPatterns") -> bool:
+        """Cheap prefilter: could a file with this basename match any manifest pattern?
+
+        False is authoritative; True still has to be confirmed by
+        _matches_manifest_pattern against the scan-root-relative path.
+        """
+        if normalized_name in patterns.candidate_basenames:
+            return True
+        return (
+            patterns.candidate_basename_regex is not None
+            and patterns.candidate_basename_regex.match(normalized_name) is not None
+        )
+
+    @staticmethod
+    def _matches_manifest_pattern(relative_path: str, patterns: "ManifestPatterns") -> bool:
+        """Return whether a scan-root-relative path matches a manifest pattern."""
+        normalized_path = relative_path.replace("\\", "/").casefold()
+        basename = normalized_path.rsplit("/", 1)[-1]
+        if basename in patterns.literal_basenames:
+            return True
+        if any(fnmatch.fnmatchcase(basename, pattern) for pattern in patterns.basename_globs):
+            return True
+        if not patterns.path_globs:
+            return False
+
+        candidate = PurePath(normalized_path)
+        return any(candidate.match(pattern) for pattern in patterns.path_globs)
+
+    @staticmethod
+    def _matches_excluded_directory(directory_name: str, excluded_dirs: Set[str]) -> bool:
+        """Match configured directory exclusions, including entries such as ``*.egg-info``."""
+        return any(fnmatch.fnmatchcase(directory_name, pattern) for pattern in excluded_dirs)
+
     def find_files(self, path: str, ecosystems: Optional[List[str]] = None) -> List[str]:
         """
         Finds supported manifest files in the given path.
@@ -289,47 +647,107 @@ class Core:
         Returns:
             List of found manifest file paths.
         """
-        log.debug("Starting Find Files")
-        start_time = time.time()
+        log.debug("Starting manifest discovery")
+        start_time = time.perf_counter()
         files: Set[str] = set()
 
-        # Get supported patterns from the API
+        # Unified --exclude-paths: filter discovered manifests by the same paths/globs that are
+        # forwarded to coana's --exclude-dirs. Only consulted when the user supplied the flag.
+        # Patterns are anchored to `path` (the scan root this pass walks), matching coana's
+        # target and the Node CLI's fast-glob cwd. NOTE: when scanning multiple --sub-path
+        # targets, find_files runs once per sub-path, so a pattern like `tests` anchors to each
+        # sub-path independently (Node anchors all patterns to a single scan-root cwd). This only
+        # differs for the multi-target full-scan + --exclude-paths combo; the reach flow is
+        # single-target, so it matches Node there.
+        exclude_paths = getattr(self.cli_config, "exclude_paths", None) if self.cli_config else None
+        exclude_regexes = Core.compile_exclude_paths(exclude_paths) if exclude_paths else []
+
         patterns = self.get_supported_patterns()
+        manifest_patterns = self._prepare_manifest_patterns(
+            patterns,
+            ecosystems,
+            self.config.excluded_ecosystems,
+        )
 
-        for ecosystem in patterns:
-            # If ecosystems filter is provided, only include specified ecosystems
-            if ecosystems is not None and ecosystem not in ecosystems:
-                continue
-            if ecosystem in self.config.excluded_ecosystems:
-                continue
-            log.debug(f'Scanning ecosystem: {ecosystem}')
-            ecosystem_patterns = patterns[ecosystem]
-            for file_name in ecosystem_patterns:
-                original_pattern = ecosystem_patterns[file_name]["pattern"]
+        if manifest_patterns.is_empty:
+            elapsed = time.perf_counter() - start_time
+            log.info(
+                "Manifest discovery completed in "
+                f"{elapsed:.2f}s: root={os.path.abspath(path)}, "
+                "directories_visited=0, directories_pruned=0, "
+                "files_visited=0, manifests_found=0"
+            )
+            log.info("Total files found: 0")
+            return []
 
-                # Expand brace patterns
-                expanded_patterns = Core.expand_brace_pattern(original_pattern)
+        directories_visited = 0
+        directories_pruned = 0
+        files_visited = 0
+        excluded_dirs = set(self.config.excluded_dirs)
 
-                for pattern in expanded_patterns:
-                    case_insensitive_pattern = Core.to_case_insensitive_regex(pattern)
-                    
-                    log.debug(f"Searching for pattern: {case_insensitive_pattern}")
-                    glob_start = time.time()
-                    
-                    # Use pathlib.Path.rglob() instead of glob.glob() to properly match dotfiles/dotdirs
-                    base_path = Path(path)
-                    glob_files = base_path.rglob(case_insensitive_pattern)
+        def handle_walk_error(error: OSError) -> None:
+            log.debug(f"Unable to inspect path during manifest discovery: {error}")
 
-                    for glob_file in glob_files:
-                        glob_file_str = str(glob_file)
-                        if os.path.isfile(glob_file_str) and not Core.is_excluded(glob_file_str, self.config.excluded_dirs):
-                            files.add(glob_file_str.replace("\\", "/"))
+        for current_root, directory_names, file_names in os.walk(
+                path,
+                topdown=True,
+                followlinks=False,
+                onerror=handle_walk_error,
+        ):
+            directories_visited += 1
 
-                    glob_end = time.time()
-                    log.debug(f"Globbing took {glob_end - glob_start:.4f} seconds")
+            kept_directories = []
+            for directory_name in directory_names:
+                if directory_name == ".git" or Core._matches_excluded_directory(
+                        directory_name,
+                        excluded_dirs,
+                ):
+                    directories_pruned += 1
+                    continue
+                # Only --exclude-paths needs a scan-root-relative path, so build one
+                # lazily rather than for every directory in the repository.
+                if exclude_regexes:
+                    relative_directory = os.path.relpath(
+                        os.path.join(current_root, directory_name),
+                        path,
+                    )
+                    if Core.path_matches_exclude_regexes(relative_directory, exclude_regexes):
+                        directories_pruned += 1
+                        continue
+                kept_directories.append(directory_name)
+            directory_names[:] = kept_directories
+
+            files_visited += len(file_names)
+            for file_name in file_names:
+                # Reject on the basename first: os.walk already hands us the name, so
+                # non-manifests cost one set lookup instead of a relative path plus a
+                # path match. Exclusions are then only evaluated for real candidates.
+                if not Core._basename_could_match(file_name.casefold(), manifest_patterns):
+                    continue
+                file_path = os.path.join(current_root, file_name)
+                relative_path = os.path.relpath(file_path, path)
+                if not Core._matches_manifest_pattern(relative_path, manifest_patterns):
+                    continue
+                if exclude_regexes and Core.path_matches_exclude_regexes(
+                        relative_path,
+                        exclude_regexes,
+                ):
+                    continue
+                if os.path.isfile(file_path):
+                    files.add(file_path.replace("\\", "/"))
 
         file_list = sorted(files)
         file_count = len(file_list)
+        elapsed = time.perf_counter() - start_time
+        log.info(
+            "Manifest discovery completed in "
+            f"{elapsed:.2f}s: root={os.path.abspath(path)}, "
+            f"directories_visited={directories_visited}, "
+            f"directories_pruned={directories_pruned}, "
+            f"files_visited={files_visited}, manifests_found={file_count}"
+        )
+        # Retain the established count-only message for log consumers while they
+        # transition to the stage-level timing above.
         log.info(f"Total files found: {file_count}")
 
         # Check if the number of manifest files might exceed ulimit -n
@@ -371,19 +789,36 @@ class Core:
         Returns:
             Dictionary of supported file patterns with 'general' key removed
         """
+        cached_patterns = getattr(self, "_supported_patterns", None)
+        if cached_patterns is not None:
+            log.debug("Using cached supported manifest patterns")
+            return cached_patterns
+
+        start_time = time.perf_counter()
         response = self.sdk.report.supported()
+        source = "api"
         if not response:
             log.error("Failed to get supported patterns from API")
-            # Import the old patterns as fallback
-            from .utils import socket_globs
-            return socket_globs
+            response = socket_globs
+            source = "local-fallback"
 
-        # Remove the 'general' key if it exists
-        if 'general' in response:
-            response.pop('general')
-
-        # The response is already in the format we need
-        return response
+        # Do not mutate the SDK response, which may be shared by its own cache.
+        patterns = {
+            ecosystem: ecosystem_patterns
+            for ecosystem, ecosystem_patterns in response.items()
+            if ecosystem != "general"
+        }
+        # Only cache a successful lookup. The local fallback covers far fewer ecosystems
+        # than the API, so one transient failure must not pin the rest of the run to it —
+        # has_manifest_files() runs before find_files() and would poison the cache.
+        if source == "api":
+            self._supported_patterns = patterns
+        elapsed = time.perf_counter() - start_time
+        log.info(
+            "Supported manifest patterns loaded in "
+            f"{elapsed:.2f}s: source={source}, ecosystems={len(patterns)}"
+        )
+        return patterns
 
     def has_manifest_files(self, files: list) -> bool:
         """
@@ -414,14 +849,14 @@ class Core:
                 # Expand brace patterns for each manifest pattern
                 expanded_patterns = Core.expand_brace_pattern(pattern_str)
                 for exp_pat in expanded_patterns:
-                    # If pattern doesn't contain '/', prepend '**/' to match files in any subdirectory
-                    # This ensures patterns like '*requirements.txt' match '.test/requirements.txt'
-                    if '/' not in exp_pat:
-                        exp_pat = f"**/{exp_pat}"
-                    
                     for file in norm_files:
-                        # Use PurePath.match for glob-like matching
+                        # Match the pattern as-is first (handles root-level files
+                        # like "package.json" matching pattern "package.json")
                         if PurePath(file).match(exp_pat):
+                            return True
+                        # Also try with **/ prefix to match files in subdirectories
+                        # (e.g. "src/requirements.txt" matching "*requirements.txt")
+                        if '/' not in exp_pat and PurePath(file).match(f"**/{exp_pat}"):
                             return True
         return False
 
@@ -456,39 +891,50 @@ class Core:
     @staticmethod
     def empty_head_scan_file() -> List[str]:
         """
-        Creates a temporary empty file for baseline scans when no head scan exists.
-        
+        Creates a temporary placeholder manifest for scans with no manifest files.
+
+        Used for baseline scans when a repository has no head scan yet, and for the new scan
+        when no supported manifest files were found. The API rejects unsupported filenames, so
+        the placeholder must be named ``.socket.facts.json`` - which means it must also parse
+        as a facts document. A zero-byte file does not, and the API answers that by adding a
+        blocking ``generic/invalid-socket-facts@1.0.0`` artifact to the scan.
+
+        Each call gets its own temp directory. The path used to be a fixed
+        ``$TMPDIR/.socket.facts.json``, so two runs sharing a temp dir could delete or
+        truncate each other's placeholder mid-upload.
+
         Returns:
-            List containing path to a temporary empty file
+            List containing path to a temporary placeholder facts file
         """
-        # Create a temporary directory and then create our specific filename
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, '.socket.facts.json')
-        
-        # Create the empty file
+        # Own directory per call so concurrent runs can't clobber each other's placeholder;
+        # the basename must stay exactly SOCKET_FACTS_FILENAME to pass the API's validator.
+        temp_dir = tempfile.mkdtemp(prefix='socket_baseline_')
+        _PLACEHOLDER_FACTS_DIRS.append(temp_dir)
+        temp_path = os.path.join(temp_dir, SOCKET_FACTS_FILENAME)
+
         with open(temp_path, 'w') as f:
-            pass  # Creates an empty file
-        
-        log.debug(f"Created temporary empty file for baseline scan: {temp_path}")
+            f.write(SOCKET_FACTS_EMPTY_DOCUMENT)
+
+        log.debug(f"Created temporary placeholder facts file for baseline scan: {temp_path}")
         return [temp_path]
 
     def finalize_tier1_scan(self, full_scan_id: str, facts_file_path: str) -> bool:
         """
-        Finalize a tier 1 reachability scan by associating it with a full scan.
+        Finalize a full application reachability scan by associating it with a full scan.
 
         This function reads the tier1ReachabilityScanId from the facts file and
         calls the SDK to link it with the specified full scan.
 
-        Linking the tier 1 scan to the full scan helps the Socket team debug potential issues.
+        Linking the reachability scan to the full scan helps the Socket team debug potential issues.
 
         Args:
-            full_scan_id: The ID of the full scan to associate with the tier 1 scan
+            full_scan_id: The ID of the full scan to associate with the reachability scan
             facts_file_path: Path to the .socket.facts.json file containing the tier1ReachabilityScanId
 
         Returns:
             True if successful, False otherwise
         """
-        log.debug(f"Finalizing tier 1 scan for full scan {full_scan_id}")
+        log.debug(f"Finalizing full application reachability scan for full scan {full_scan_id}")
 
         # Read the tier1ReachabilityScanId from the facts file
         try:
@@ -511,20 +957,139 @@ class Core:
             log.debug(f"Failed to read tier1ReachabilityScanId from {facts_file_path}: {e}")
             return False
 
-        # Call the SDK to finalize the tier 1 scan
-        try:
-            success = self.sdk.fullscans.finalize_tier1(
-                full_scan_id=full_scan_id,
-                tier1_reachability_scan_id=tier1_scan_id,
+        # Call the SDK to finalize the full application reachability scan, retrying transient failures with backoff.
+        last_error: Optional[Exception] = None
+        for attempt in range(1, TIER1_FINALIZE_MAX_ATTEMPTS + 1):
+            try:
+                success = self.sdk.fullscans.finalize_tier1(
+                    full_scan_id=full_scan_id,
+                    tier1_reachability_scan_id=tier1_scan_id,
+                )
+
+                if success:
+                    log.debug(f"Successfully finalized full application reachability scan {tier1_scan_id} for full scan {full_scan_id}")
+                    return True
+
+                log.debug(
+                    f"finalize_tier1 returned a falsy result for scan {tier1_scan_id} "
+                    f"(attempt {attempt}/{TIER1_FINALIZE_MAX_ATTEMPTS})"
+                )
+            except Exception as e:
+                last_error = e
+                log.debug(
+                    f"Unable to finalize full application reachability scan (attempt {attempt}/{TIER1_FINALIZE_MAX_ATTEMPTS}): {e}"
+                )
+
+            if attempt < TIER1_FINALIZE_MAX_ATTEMPTS:
+                time.sleep(TIER1_FINALIZE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+
+        if last_error is not None:
+            log.debug(
+                f"Giving up finalizing full application reachability scan {tier1_scan_id} after "
+                f"{TIER1_FINALIZE_MAX_ATTEMPTS} attempts: {last_error}"
             )
+        else:
+            log.debug(
+                f"Giving up finalizing full application reachability scan {tier1_scan_id} after "
+                f"{TIER1_FINALIZE_MAX_ATTEMPTS} attempts"
+            )
+        return False
 
-            if success:
-                log.debug(f"Successfully finalized tier 1 scan {tier1_scan_id} for full scan {full_scan_id}")
-            return success
+    @staticmethod
+    def _compress_facts_file(source_path: str) -> str:
+        """Brotli-compress a ``.socket.facts.json`` file to a sibling ``.socket.facts.json.br``.
 
-        except Exception as e:
-            log.debug(f"Unable to finalize tier 1 scan: {e}")
-            return False
+        The source is streamed in chunks so a large facts file (hundreds of MB) never has
+        to be held in memory at once. The compressed file is written next to the source so
+        that the multipart key the SDK derives keeps the same directory prefix, only with a
+        ``.br`` basename. Any existing ``.socket.facts.json.br`` sibling is overwritten, and a
+        partially-written output is removed if compression fails part-way through (e.g. the
+        disk fills up mid-stream) so no orphaned ``.br`` is left in the target directory.
+
+        Args:
+            source_path: Path to the plain ``.socket.facts.json`` file.
+
+        Returns:
+            Path to the compressed sibling file.
+        """
+        # Imported lazily so the dependency is only needed when actually uploading a facts
+        # file. brotlicffi is the API-compatible fallback used on PyPy / non-CPython runtimes.
+        try:
+            import brotli
+        except ImportError:
+            import brotlicffi as brotli
+
+        target_path = os.path.join(os.path.dirname(source_path), SOCKET_FACTS_BROTLI_FILENAME)
+        compressor = brotli.Compressor(
+            quality=SOCKET_FACTS_BROTLI_QUALITY,
+            lgwin=SOCKET_FACTS_BROTLI_LGWIN,
+        )
+        try:
+            with open(source_path, "rb") as src, open(target_path, "wb") as dst:
+                while True:
+                    chunk = src.read(SOCKET_FACTS_BROTLI_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    compressed = compressor.process(chunk)
+                    if compressed:
+                        dst.write(compressed)
+                dst.write(compressor.finish())
+        except BaseException:
+            # Don't leave a half-written .br behind for the caller to miss (it only tracks
+            # the path for cleanup once this returns). Remove it, then re-raise so the caller
+            # falls back to uploading the plain file.
+            try:
+                os.unlink(target_path)
+            except OSError:
+                pass
+            raise
+        return target_path
+
+    def _compress_facts_files_for_upload(self, files: List[str]) -> Tuple[List[str], List[str]]:
+        """Replace any ``.socket.facts.json`` upload entry with a brotli-compressed ``.br`` sibling.
+
+        The Socket full-scan endpoint transparently decompresses a multipart part named
+        exactly ``.socket.facts.json.br``, so compressing here keeps a large facts file under
+        the server's per-file size cap without changing the stored result. Files whose
+        basename is not exactly ``.socket.facts.json`` are left untouched (the server only
+        matches that exact name), as are zero-byte files.
+
+        Compression never blocks an upload: if it fails for any reason (missing optional
+        ``brotli`` dependency, unwritable directory, etc.) the original plain file is used.
+
+        Args:
+            files: The list of file paths about to be uploaded.
+
+        Returns:
+            ``(upload_files, temp_paths)`` where ``upload_files`` is the possibly-rewritten
+            list to upload and ``temp_paths`` are compressed files the caller must delete
+            once the upload completes.
+        """
+        upload_files: List[str] = []
+        temp_paths: List[str] = []
+        for file_path in files:
+            try:
+                if (
+                    os.path.basename(file_path) == SOCKET_FACTS_FILENAME
+                    and os.path.isfile(file_path)
+                    and os.path.getsize(file_path) > 0
+                ):
+                    compressed_path = self._compress_facts_file(file_path)
+                    log.debug(
+                        f"Brotli-compressed {file_path} for upload: "
+                        f"{os.path.getsize(file_path)} -> {os.path.getsize(compressed_path)} bytes "
+                        f"(uploading as {SOCKET_FACTS_BROTLI_FILENAME})"
+                    )
+                    upload_files.append(compressed_path)
+                    temp_paths.append(compressed_path)
+                    continue
+            except Exception as e:
+                # Never let compression break an upload: fall back to the plain file.
+                log.warning(
+                    f"Failed to brotli-compress facts file {file_path}, uploading uncompressed: {e}"
+                )
+            upload_files.append(file_path)
+        return upload_files, temp_paths
 
     def create_full_scan(self, files: List[str], params: FullScanParams, base_paths: Optional[List[str]] = None) -> FullScan:
         """
@@ -541,7 +1106,62 @@ class Core:
         log.info("Creating new full scan")
         create_full_start = time.time()
 
-        res = self.sdk.fullscans.post(files, params, use_types=True, use_lazy_loading=True, max_open_files=50, base_paths=base_paths)
+        # Brotli-compress the reachability facts file (if present) so it is uploaded as a
+        # `.socket.facts.json.br` part. The API decompresses it server-side, keeping a large
+        # facts file under the per-file upload size cap. See _compress_facts_files_for_upload.
+        upload_files, compressed_temp_files = self._compress_facts_files_for_upload(files)
+        try:
+            # Retry transient gateway/timeout failures (502/503/504/408, dropped connections,
+            # timeouts) with increasing waits. In these failure modes the server never finished
+            # reading the request body, so no scan was created and a retry does not duplicate
+            # one (see the retry-policy comment above FULL_SCAN_UPLOAD_BACKOFF_SCHEDULE_SECONDS).
+            # fullscans.post() rebuilds its lazy file loaders from the plain paths in
+            # upload_files on every call, so simply calling it again per attempt is safe. The
+            # loop must stay inside this try so the temp .br files (cleaned up in the finally
+            # below) outlive every attempt.
+            for attempt, backoff_seconds in enumerate(FULL_SCAN_UPLOAD_BACKOFF_SCHEDULE_SECONDS, start=1):
+                try:
+                    res = self.sdk.fullscans.post(upload_files, params, use_types=True, use_lazy_loading=True, max_open_files=50, base_paths=base_paths)
+                    break
+                except APIFailure as error:
+                    if error.status_code in REQUEST_TOO_LARGE_STATUS_CODES:
+                        if error.status_code == 413:
+                            guidance = (
+                                "The response does not distinguish between an oversized multipart "
+                                "upload and oversized scan metadata in the request URL. Reduce the "
+                                "uploaded scan inputs, or pass a shorter --commit-message."
+                            )
+                        else:
+                            guidance = (
+                                "Scan metadata is sent in the request URL. Pass a shorter "
+                                "--commit-message or shorten other scan metadata."
+                            )
+                        raise APIFailure(
+                            f"Full scan request rejected as too large (HTTP {error.status_code}). "
+                            f"{guidance}\n{error}",
+                            status_code=error.status_code,
+                        ) from error
+                    if backoff_seconds is None or not error.is_transient_error():
+                        raise
+                    wait_seconds = backoff_seconds + random.uniform(
+                        0, FULL_SCAN_UPLOAD_BACKOFF_JITTER_SECONDS
+                    )
+                    # SDK error messages can span many lines (path + response headers); the
+                    # first line carries the status, which is all the warning needs.
+                    error_summary = str(error).strip().splitlines()[0] if str(error).strip() else ""
+                    log.warning(
+                        f"Full scan upload failed with {type(error).__name__}({error_summary}), "
+                        f"retrying in {wait_seconds:.0f}s "
+                        f"(attempt {attempt + 1}/{FULL_SCAN_UPLOAD_MAX_ATTEMPTS})"
+                    )
+                    time.sleep(wait_seconds)
+        finally:
+            for temp_file in compressed_temp_files:
+                try:
+                    os.unlink(temp_file)
+                    log.debug(f"Cleaned up temporary compressed facts file: {temp_file}")
+                except OSError as cleanup_error:
+                    log.debug(f"Failed to clean up temporary compressed facts file {temp_file}: {cleanup_error}")
         if not res.success:
             log.error(f"Error creating full scan: {res.message}, status: {res.status}")
             raise Exception(f"Error creating full scan: {res.message}, status: {res.status}")
@@ -551,23 +1171,47 @@ class Core:
         total_time = create_full_end - create_full_start
         log.debug(f"New Full Scan created in {total_time:.2f} seconds")
 
-        # Finalize tier1 scan if reachability analysis was enabled
+        # Finalize full application reachability scan if reachability analysis was enabled
         if self.cli_config and self.cli_config.reach:
             facts_file_path = os.path.join(
-                self.cli_config.target_path or ".", 
+                self.cli_config.target_path or ".",
                 self.cli_config.reach_output_file
             )
-            log.debug(f"Reachability analysis enabled, finalizing tier1 scan for full scan {full_scan.id}")
+            log.debug(f"Reachability analysis enabled, finalizing full application reachability scan for full scan {full_scan.id}")
             try:
                 success = self.finalize_tier1_scan(full_scan.id, facts_file_path)
                 if success:
-                    log.debug(f"Successfully finalized tier1 scan for full scan {full_scan.id}")
+                    log.debug(f"Successfully finalized full application reachability scan for full scan {full_scan.id}")
                 else:
-                    log.debug(f"Failed to finalize tier1 scan for full scan {full_scan.id}")
+                    log.debug(f"Failed to finalize full application reachability scan for full scan {full_scan.id}")
             except Exception as e:
-                log.warning(f"Error finalizing tier1 scan for full scan {full_scan.id}: {e}")
+                log.warning(f"Error finalizing full application reachability scan for full scan {full_scan.id}: {e}")
 
         return full_scan
+
+    @staticmethod
+    def _log_scan_configuration(
+            paths: List[str],
+            params: FullScanParams,
+            files: List[str],
+            manifest_source: str,
+            base_paths: Optional[List[str]] = None,
+    ) -> None:
+        """Log aggregate scan inputs without exposing submitted manifest paths."""
+        base_path = base_paths[0] if base_paths else (paths[0] if paths else ".")
+        absolute_base_path = os.path.abspath(base_path)
+        relative_roots = [
+            os.path.relpath(os.path.abspath(path), absolute_base_path).replace("\\", "/")
+            for path in paths
+        ] or ["."]
+        log.info(
+            "Scan configuration: "
+            f"repo={json.dumps(getattr(params, 'repo', None), default=str)} "
+            f"workspace={json.dumps(getattr(params, 'workspace', None), default=str)} "
+            f"scan_type={json.dumps(getattr(params, 'scan_type', None), default=str)} "
+            f"roots={json.dumps(relative_roots, separators=(',', ':'))} "
+            f"manifests={len(files)} manifest_source={manifest_source}"
+        )
 
     def create_full_scan_with_report_url(
             self,
@@ -611,6 +1255,14 @@ class Core:
             for path in paths:
                 files = self.find_files(path)
                 all_files.extend(files)
+
+        self._log_scan_configuration(
+            paths,
+            params,
+            all_files,
+            manifest_source="provided" if explicit_files is not None else "discovered",
+            base_paths=base_paths,
+        )
         
         # Save submitted files list if requested
         if save_files_list_path and all_files:
@@ -662,10 +1314,86 @@ class Core:
         diff.report_url = f"{base_socket}/{self.config.org_slug}/sbom/{new_full_scan.id}"
         diff.diff_url = diff.report_url
         diff.id = new_full_scan.id
-        diff.packages = {}
+        diff.is_full_scan = True
 
-        # Return result in the format expected by the user
+        needs_alerts = (
+            self.cli_config is not None
+            and (
+                self.cli_config.enable_gitlab_security
+                or self.cli_config.enable_json
+                or self.cli_config.enable_sarif
+            )
+        )
+        # --generate-license (and --legal-format fossa, which it gates) enumerates
+        # diff.packages rather than the alert list, so a full scan has to carry the
+        # package map even when no alert-bearing output format is enabled. Without
+        # this, an SCM branch pipeline writes an attribution file with zero packages.
+        # Keep in sync with _requires_unchanged_artifacts, which lists the same
+        # consumers for the comparison path.
+        needs_license_artifacts = (
+            self.cli_config is not None and self.cli_config.generate_license
+        )
+
+        if needs_alerts or needs_license_artifacts:
+            log.info("Output format requires SBOM data, fetching it for the full scan")
+            sbom_start = time.time()
+            sbom_artifacts_dict = self.get_sbom_data(new_full_scan.id)
+            sbom_artifacts = self.get_sbom_data_list(sbom_artifacts_dict)
+            packages = self._create_packages_dict_without_license_text(sbom_artifacts)
+            if needs_license_artifacts:
+                packages = self._add_license_details(packages)
+            diff.packages = packages
+
+            if needs_alerts:
+                all_alerts_collection: Dict[str, List[Issue]] = {}
+                for package_id, package in packages.items():
+                    self.add_package_alerts_to_collection(
+                        package=package,
+                        alerts_collection=all_alerts_collection,
+                        packages=packages
+                    )
+
+                consolidated: Set[str] = set()
+                for alert_key, alerts in all_alerts_collection.items():
+                    for alert in alerts:
+                        alert_str = f"{alert.purl},{alert.type}"
+                        if (alert.error or alert.warn) and alert_str not in consolidated:
+                            diff.new_alerts.append(alert)
+                            consolidated.add(alert_str)
+                diff.alerts_fetched = True
+
+            sbom_end = time.time()
+            log.info(
+                f"Fetched {len(packages)} packages and {len(diff.new_alerts)} alerts "
+                f"in {sbom_end - sbom_start:.2f}s"
+            )
+        else:
+            diff.packages = {}
+
         return diff
+
+    def _add_license_details(self, packages: dict[str, Package]) -> dict[str, Package]:
+        """Populate licenseAttrib/licenseDetails on a full scan's package map.
+
+        get_license_text_via_purl keys off ``ecosystem/name@version`` because that is
+        what the PURL endpoint echoes back, while a full scan's package map is keyed
+        by artifact id. Build a purl-keyed view over the same Package objects so the
+        enrichment lands on the map the caller keeps.
+        """
+        batch_size = self.cli_config.max_purl_batch_size if self.cli_config else 5000
+        packages_by_purl = {}
+        for package in packages.values():
+            qualified_name = package.name
+            if package.namespace:
+                qualified_name = f"{package.namespace.strip('/')}/{qualified_name}"
+            packages_by_purl[
+                f"{package.type}/{qualified_name}@{package.version}"
+            ] = package
+        self.get_license_text_via_purl(
+            packages_by_purl,
+            batch_size=batch_size,
+        )
+        return packages
 
     def get_full_scan(self, full_scan_id: str) -> FullScan:
         """
@@ -709,6 +1437,30 @@ class Core:
                             top_level_count[top_id] = 1
                         else:
                             top_level_count[top_id] += 1
+
+        for package_id, package in packages.items():
+            package.transitives = top_level_count.get(package_id, 0)
+
+        return packages
+
+    @staticmethod
+    def _create_packages_dict_without_license_text(
+        sbom_artifacts: list[SocketArtifact],
+    ) -> dict[str, Package]:
+        """Like create_packages_dict but skips the license-metadata API call.
+
+        Used when we only need packages for alert extraction (e.g. populating
+        GitLab/JSON/SARIF reports from a full scan) and don't need license text.
+        """
+        packages: dict[str, Package] = {}
+        top_level_count: dict[str, int] = {}
+        for artifact in sbom_artifacts:
+            package = Package.from_socket_artifact(asdict(artifact))
+            if package.id not in packages:
+                packages[package.id] = package
+                if package.topLevelAncestors:
+                    for top_id in package.topLevelAncestors:
+                        top_level_count[top_id] = top_level_count.get(top_id, 0) + 1
 
         for package_id, package in packages.items():
             package.transitives = top_level_count.get(package_id, 0)
@@ -783,27 +1535,372 @@ class Core:
 
         return response.data
 
-    def get_head_scan_for_repo(self, repo_slug: str) -> str:
+    def get_head_scan_for_repo(
+            self,
+            repo_slug: str,
+            workspace: Optional[str] = None,
+            scan_type: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Gets the head scan ID for a repository.
 
+        Without a workspace or scan type this is the repository's head scan pointer.
+        That pointer tracks a single scan for the whole repository rather than one per
+        workspace or scan type, so scoped runs instead take the newest matching scan
+        on the default branch.
+
         Args:
             repo_slug: Repository slug to get head scan for
+            workspace: Socket workspace the scan belongs to, if any
+            scan_type: Socket scan type to match, if any
 
         Returns:
             Head scan ID if it exists, None otherwise
+
+        Raises:
+            APIFailure: If the scoped scan lookup fails. A failed lookup must not
+                be reported as "no baseline": the caller answers that by creating an
+                empty baseline scan, which reports every dependency in the repository
+                as newly added.
         """
         repo_info = self.get_repo_info(repo_slug)
+        if workspace or scan_type:
+            query_params = {
+                "repo": repo_slug,
+                "branch": repo_info.default_branch,
+                "sort": "created_at",
+                "direction": "desc",
+                "per_page": SCAN_LOOKUP_PAGE_SIZE,
+            }
+            if workspace:
+                query_params["workspace"] = workspace
+            if scan_type:
+                query_params["scan_type"] = Core.query_param_value(scan_type)
+            for results in self._full_scan_result_pages(
+                    query_params,
+                    f"Failed to list matching full scans for repo {repo_slug}",
+            ):
+                scan_id = Core.newest_persisted_scan_id(results)
+                if scan_id:
+                    return scan_id
+            return None
         return repo_info.head_full_scan_id if repo_info.head_full_scan_id else None
 
     @staticmethod
+    def query_param_value(value):
+        """
+        Unwraps an enum member so it survives URL encoding.
+
+        The SDK types several query params as str-backed enums (ScanType,
+        IntegrationType). urlencode calls str(), which renders a (str, Enum) member
+        as "ScanType.SOCKET_TIER1" -- a filter value the API does not recognize.
+        """
+        return getattr(value, "value", value)
+
+    @staticmethod
+    def newest_persisted_scan_id(results: List[dict]) -> Optional[str]:
+        """
+        Returns the newest scan ID from a full scan listing, skipping temporary scans.
+
+        create_new_diff creates an empty ``tmp`` scan when a repository has no baseline
+        yet, and that scan inherits the branch and commit of the run that created it.
+        If the real scan then fails, the empty scan is left behind as the newest scan
+        for that branch/commit; selecting it as a baseline would report every
+        dependency as newly added.
+
+        Args:
+            results: Full scan listing results, newest first
+
+        Returns:
+            Newest non-temporary scan ID, or None if the listing has none
+        """
+        for result in results or []:
+            if not isinstance(result, dict) or result.get("tmp"):
+                continue
+            scan_id = result.get("id")
+            if scan_id:
+                return scan_id
+        return None
+
+    def _full_scan_result_pages(
+            self,
+            query_params: dict,
+            failure_message: str,
+    ) -> Iterator[List[dict]]:
+        """Yields successful full-scan listing pages and rejects failed lookups."""
+        request_params = dict(query_params)
+        seen_pages = {str(request_params.get("page", 1))}
+        per_page = int(request_params.get("per_page", 30))
+
+        while True:
+            response = self.sdk.fullscans.get(self.config.org_slug, request_params)
+            results = response.get("results") if isinstance(response, dict) else None
+            if results is None:
+                # The SDK logs and returns {} for any non-200, so a present results
+                # key is the only signal that the request itself succeeded.
+                raise APIFailure(failure_message)
+            yield results
+
+            next_page = response.get("nextPage")
+            # The API has historically returned nextPage=1 for a short final page.
+            if len(results) < per_page or next_page in (None, 0, "0", False, ""):
+                return
+
+            page_key = str(next_page)
+            if page_key in seen_pages:
+                raise APIFailure(
+                    f"{failure_message}: full-scan pagination repeated page {next_page}"
+                )
+            seen_pages.add(page_key)
+            request_params = {**query_params, "page": next_page}
+
+    def first_parent_commits(self, start_commit_sha: str, max_count: int) -> List[str]:
+        """
+        Lists a commit and its first-parent ancestors, newest first.
+
+        Follows only first parents so a merge commit contributes the branch's own
+        history rather than everything merged into it. A shallow checkout simply
+        yields fewer commits, which narrows the search rather than failing it.
+
+        Args:
+            start_commit_sha: Commit to walk back from, included in the result
+            max_count: Maximum number of commits to return
+
+        Returns:
+            Commit SHAs, newest first. Empty when the repository or commit is
+            unavailable locally.
+        """
+        target_path = self.cli_config.target_path if self.cli_config else None
+        if not target_path:
+            return []
+        try:
+            repo = Repo(target_path)
+            output = repo.git.rev_list(
+                "--first-parent",
+                f"--max-count={max_count}",
+                start_commit_sha,
+            )
+        except Exception as error:
+            log.debug(f"Unable to walk history back from {start_commit_sha}: {error}")
+            return []
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
+    def find_baseline_scan_for_ancestor(
+            self,
+            repo_slug: str,
+            commit_sha: str,
+            workspace: Optional[str] = None,
+            scan_type: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str], int]:
+        """
+        Finds the nearest ancestor of a commit that does have a full scan.
+
+        Used when --base-commit-sha names a commit that was never scanned. Squash
+        merges and rebases rewrite commits, and a multi-commit push produces one scan
+        for the tip, so a merge base can be unscanned even when default-branch
+        scanning is configured correctly. Diffing against a slightly older ancestor
+        is a wider diff; failing outright is no diff at all.
+
+        Scan listing pages are matched against local first-parent history. All pages
+        are considered because scans from other branches and reruns can fill newer
+        pages without covering the nearest candidate ancestors.
+
+        Args:
+            repo_slug: Repository slug the scan belongs to
+            commit_sha: Commit that has no full scan of its own
+            workspace: Socket workspace the scan belongs to, if any
+            scan_type: Socket scan type to match, if any
+
+        Returns:
+            (scan_id, ancestor_commit_sha, commits_back), or (None, None, 0) when no
+            scanned ancestor is reachable.
+        """
+        ancestors = self.first_parent_commits(commit_sha, ANCESTOR_WALK_MAX_DEPTH)
+        if not ancestors:
+            return None, None, 0
+
+        query_params = {
+            "repo": repo_slug,
+            "sort": "created_at",
+            "direction": "desc",
+            "per_page": ANCESTOR_SCAN_LOOKUP_LIMIT,
+        }
+        if workspace:
+            query_params["workspace"] = workspace
+        if scan_type:
+            query_params["scan_type"] = Core.query_param_value(scan_type)
+
+        scans_by_commit = {}
+        ancestor_set = set(ancestors)
+        for results in self._full_scan_result_pages(
+                query_params,
+                f"Failed to list ancestor full scans for repo {repo_slug}",
+        ):
+            for result in results:
+                if not isinstance(result, dict) or result.get("tmp"):
+                    continue
+                result_commit = result.get("commit_hash")
+                scan_id = result.get("id")
+                # Newest first, so the first scan seen for a commit is the one to keep.
+                if (
+                        result_commit in ancestor_set
+                        and scan_id
+                        and result_commit not in scans_by_commit
+                ):
+                    scans_by_commit[result_commit] = scan_id
+
+        if not scans_by_commit:
+            return None, None, 0
+
+        for distance, ancestor in enumerate(ancestors):
+            scan_id = scans_by_commit.get(ancestor)
+            if scan_id:
+                return scan_id, ancestor, distance
+        return None, None, 0
+
+    def get_full_scan_id_by_commit(
+            self,
+            repo_slug: str,
+            commit_sha: str,
+            workspace: Optional[str] = None,
+            scan_type: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Finds the most recent full scan for a repository + commit SHA.
+
+        Used by --base-commit-sha to resolve the diff baseline (e.g. the merge-base
+        commit of a PR). When the same commit was scanned more than once, the newest
+        scan wins.
+
+        Args:
+            repo_slug: Repository slug the scan belongs to
+            commit_sha: Commit SHA the scan was created from
+            workspace: Socket workspace the scan belongs to, if any
+            scan_type: Socket scan type to match, if any
+
+        Returns:
+            Full scan ID if one exists for that commit, None otherwise
+        """
+        query_params = {
+            "repo": repo_slug,
+            "commit_hash": commit_sha,
+            "sort": "created_at",
+            "direction": "desc",
+            "per_page": SCAN_LOOKUP_PAGE_SIZE,
+        }
+        if workspace:
+            query_params["workspace"] = workspace
+        if scan_type:
+            query_params["scan_type"] = Core.query_param_value(scan_type)
+
+        for results in self._full_scan_result_pages(
+                query_params,
+                f"Failed to list full scans for commit {commit_sha} in repo {repo_slug}",
+        ):
+            scan_id = Core.newest_persisted_scan_id(results)
+            if scan_id:
+                return scan_id
+        return None
+
+    def resolve_base_full_scan_id(self, params: FullScanParams) -> Optional[str]:
+        """
+        Resolves the baseline full scan ID to diff a new scan against.
+
+        Priority: --base-scan-id (used verbatim), then --base-commit-sha (newest
+        full scan for that commit, or its nearest scanned first-parent ancestor),
+        then the repository's current matching head scan. A --base-commit-sha with
+        no reachable scanned ancestor is a hard error rather than a silent fallback
+        to the head scan, because diffing against the wrong baseline silently
+        misreports which alerts a PR introduces.
+
+        Returns:
+            Full scan ID to use as the diff baseline, or None when the repository
+            has no head scan yet (caller creates an empty baseline scan).
+        """
+        if self.cli_config and self.cli_config.base_scan_id:
+            log.info(
+                "Baseline selected: source=explicit-scan "
+                f"scan_id={json.dumps(self.cli_config.base_scan_id)}"
+            )
+            return self.cli_config.base_scan_id
+
+        if self.cli_config and self.cli_config.base_commit_sha:
+            commit_sha = self.cli_config.base_commit_sha
+            scan_id = self.get_full_scan_id_by_commit(
+                params.repo,
+                commit_sha,
+                workspace=params.workspace,
+                scan_type=params.scan_type,
+            )
+            baseline_source = "explicit-commit"
+            baseline_commit = commit_sha
+            if scan_id is None:
+                scan_id, ancestor_sha, commits_back = self.find_baseline_scan_for_ancestor(
+                    params.repo,
+                    commit_sha,
+                    workspace=params.workspace,
+                    scan_type=params.scan_type,
+                )
+                if scan_id:
+                    baseline_source = "explicit-commit-ancestor"
+                    baseline_commit = ancestor_sha
+                    log.warning(
+                        f"No full scan for commit {commit_sha} (--base-commit-sha). "
+                        f"Diffing against its nearest scanned ancestor {ancestor_sha}, "
+                        f"{commits_back} commit(s) earlier, so the diff is wider than "
+                        "the merge base."
+                    )
+                else:
+                    log.error(
+                        f"No full scan found for commit {commit_sha} in repo {params.repo} "
+                        "(--base-commit-sha), and no scanned ancestor within "
+                        f"{ANCESTOR_WALK_MAX_DEPTH} commits of it. Ensure a scan was "
+                        "created for that commit (e.g. the CLI runs on default-branch "
+                        "pushes), or pass --base-scan-id instead."
+                    )
+                    if self.cli_config.disable_blocking:
+                        sys.exit(0)
+                    sys.exit(self.cli_config.exit_code_on_api_error)
+            log.info(
+                f"Baseline selected: source={baseline_source} "
+                f"scan_id={json.dumps(scan_id)} commit={json.dumps(baseline_commit)}"
+            )
+            return scan_id
+
+        try:
+            scan_id = self.get_head_scan_for_repo(
+                params.repo,
+                workspace=params.workspace,
+                scan_type=params.scan_type,
+            )
+        except APIResourceNotFound:
+            return None
+        except APIFailure as error:
+            # Returning None would make the caller create an empty baseline scan,
+            # reporting every dependency as newly added, so fail loudly like the
+            # --base-commit-sha path above.
+            log.error(
+                f"Failed to resolve the matching head scan for repo {params.repo}: {error}"
+            )
+            if self.cli_config is None:
+                raise
+            if self.cli_config.disable_blocking:
+                sys.exit(0)
+            sys.exit(self.cli_config.exit_code_on_api_error)
+        if scan_id:
+            log.info(
+                "Baseline selected: source=repository-head "
+                f"scan_id={json.dumps(scan_id)}"
+            )
+        return scan_id
+
+    @staticmethod
     def update_package_values(pkg: Package) -> Package:
+        pkg.type = Package.normalize_type(pkg.type)
         pkg.purl = f"{pkg.name}@{pkg.version}"
-        pkg.url = f"https://socket.dev/{pkg.type}/package"
         if pkg.namespace:
             pkg.purl = f"{pkg.namespace}/{pkg.purl}"
-            pkg.url += f"/{pkg.namespace}"
-        pkg.url += f"/{pkg.name}/overview/{pkg.version}"
+        pkg.url = Package.socket_url(pkg.type, pkg.namespace, pkg.name, pkg.version)
         return pkg
 
     def get_license_text_via_purl(self, packages: dict[str, Package], batch_size: int = 5000) -> dict:
@@ -838,6 +1935,7 @@ class Core:
             results = self.sdk.purl.post(
                 license=True,
                 components=batch_components,
+                org_slug=self.config.org_slug,
                 licenseattrib=True,
                 licensedetails=True
             )
@@ -846,6 +1944,9 @@ class Core:
             for result in results:
                 ecosystem = result["type"]
                 name = result["name"]
+                namespace = (result.get("namespace") or "").strip("/")
+                if namespace and not name.startswith(f"{namespace}/"):
+                    name = f"{namespace}/{name}"
                 package_version = result["version"]
                 licenseDetails = result.get("licenseDetails")
                 licenseAttrib = result.get("licenseAttrib")
@@ -856,10 +1957,203 @@ class Core:
         
         return packages
 
+    def get_diff_scan_artifacts(
+            self,
+            head_full_scan_id: str,
+            new_full_scan_id: str,
+            external_href: Optional[str] = None
+    ) -> DiffArtifacts:
+        """Compare two full scans via the diff-scans endpoints, polling for the result.
+
+        Creates a diff-scan resource from the two full scan IDs, then polls
+        ``GET /orgs/{org}/diff-scans/{id}?cached=true`` until the API returns the
+        computed comparison (200) instead of a processing status (202). Unlike the
+        legacy ``fullscans.stream_diff`` call, no request is ever left idle while
+        the backend computes, so the comparison survives network idle timeouts.
+        See the DIFF_SCAN_POLL_* constants for the polling policy.
+
+        Requires an org token with the ``diff-scans:create``, ``diff-scans:list``
+        and ``full-scans:list`` scopes; callers are expected to catch failures and
+        fall back to the legacy streaming comparison.
+
+        Note that cached diff-scan responses always embed per-package license
+        details (the API ignores ``omit_license_details`` when ``cached=true``),
+        so unlike the legacy streaming comparison there is no lean-response
+        option here; see the comment on ``poll_params`` below.
+
+        Args:
+            head_full_scan_id: The before/base full scan ID
+            new_full_scan_id: The after/head full scan ID
+            external_href: Optional pull request or merge request URL to associate
+                with the diff scan in the Socket Dashboard
+
+        Returns:
+            DiffArtifacts with the added/removed/unchanged/replaced/updated lists
+        """
+        create_params = {
+            "before": head_full_scan_id,
+            "after": new_full_scan_id,
+            "description": f"Socket Security CLI v{__version__} scan comparison",
+        }
+        if external_href:
+            create_params["external_href"] = external_href
+            # external_href is only honored while a diff scan is being created,
+            # so a re-run over an already-compared scan pair needs
+            # on_duplicate=update to apply the link to the existing resource. It
+            # answers 200 with the same {"diff_scan": ...} envelope as a create.
+            create_params["on_duplicate"] = "update"
+        try:
+            result = self.sdk.diffscans.create_from_ids(self.config.org_slug, create_params)
+            diff_scan = result.get("diff_scan") or {}
+            response_summary = result
+        except APIFailure as error:
+            if error.status_code != 409:
+                raise
+
+            # Reached when there is no pull request context to attach, and on
+            # deployments that answer 409 regardless. Do NOT switch this to
+            # on_duplicate=redirect: the SDK follows that 302 automatically with
+            # a GET that lacks cached=true, which can leave the connection idle
+            # while an existing diff scan is still computing. Resolve the
+            # duplicate explicitly so every result fetch continues through the
+            # bounded cached polling path below.
+            existing = self.sdk.diffscans.list(
+                self.config.org_slug,
+                params={
+                    "before_full_scan_id": head_full_scan_id,
+                    "after_full_scan_id": new_full_scan_id,
+                    "per_page": 1,
+                },
+            )
+            matches = existing.get("results") or []
+            diff_scan = matches[0] if matches else {}
+            response_summary = existing
+
+        diff_scan_id = diff_scan.get("id")
+        if not diff_scan_id:
+            raise Exception(
+                "Error creating or resolving diff scan: "
+                f"unexpected response: {str(response_summary)[:500]}"
+            )
+        # Logged at INFO, not debug: this is the only identifier that ties a slow or
+        # failed comparison in a CI log back to a server-side diff scan, and it is
+        # needed even when the run later falls back to the streaming comparison.
+        log.info(f"Diff scan created: id={diff_scan_id}")
+
+        # The create and list endpoints are metadata-only. Always fetch artifacts
+        # through GET below, even if an unexpected/legacy response happens to embed
+        # them, so omit_unchanged and the bounded cached-polling contract cannot be
+        # bypassed by an eager response.
+        artifacts_dict = None
+
+        # cached=true is the polling contract (202 while computing, 200 when
+        # ready). The API ignores omit_license_details when cached=true - cached
+        # results always embed license details - so there is no lean-response
+        # option on this path (unlike stream_diff with
+        # include_license_details=false, the lean-payload mitigation). If that extra
+        # payload ever gets a response truncated on a huge dependency tree,
+        # response.json() fails and the caller falls back to the legacy
+        # streaming comparison, which still requests the lean payload.
+        #
+        # Verified against the live API: passing omit_license_details alongside
+        # cached=true leaves the license fields in the response, but omit_unchanged
+        # IS honored and drops the unchanged artifacts entirely (~1.1 KB each), so
+        # it is requested whenever no enabled output reads them. See
+        # _requires_unchanged_artifacts.
+        poll_params = {"cached": "true"}
+        omit_unchanged = not self._requires_unchanged_artifacts()
+        if omit_unchanged:
+            poll_params["omit_unchanged"] = "true"
+        poll_start = time.monotonic()
+        deadline = poll_start + DIFF_SCAN_POLL_TIMEOUT_SECONDS
+        interval = DIFF_SCAN_POLL_INITIAL_INTERVAL_SECONDS
+        # Tracked so the completion log can separate backend compute time from time the
+        # result spent ready-but-unpolled: the wait before the final poll bounds the
+        # latter, which is otherwise invisible in a CI log.
+        polls = 0
+        last_interval = 0.0
+        while artifacts_dict is None:
+            try:
+                response = self.sdk.diffscans.get(self.config.org_slug, diff_scan_id, params=poll_params)
+            except APIFailure as error:
+                if not error.is_transient_error():
+                    raise
+                # A dropped/timed-out poll is retryable: the diff scan keeps
+                # computing server-side regardless of what happens to any one poll.
+                log.warning(
+                    f"Transient error polling diff scan {diff_scan_id} "
+                    f"({type(error).__name__}), retrying in {interval:.0f}s"
+                )
+                response = {"status": "processing"}
+            polls += 1
+            if response.get("status") != "processing":
+                scan = response.get("diff_scan") or {}
+                if scan.get("artifacts") is None:
+                    raise Exception(
+                        f"Error fetching diff scan {diff_scan_id}: unexpected response: {str(response)[:500]}"
+                    )
+                artifacts_dict = scan["artifacts"]
+                log.info(
+                    "Diff scan comparison ready in "
+                    f"{time.monotonic() - poll_start:.2f}s: id={diff_scan_id}, "
+                    f"polls={polls}, wait_before_final_poll={last_interval:.0f}s, "
+                    f"omit_unchanged={str(omit_unchanged).lower()}"
+                )
+                break
+            if time.monotonic() >= deadline:
+                raise Exception(
+                    f"Timed out waiting for diff scan {diff_scan_id} after "
+                    f"{DIFF_SCAN_POLL_TIMEOUT_SECONDS:.0f} seconds"
+                )
+            log.debug(f"Diff scan {diff_scan_id} still processing, polling again in {interval:.0f}s")
+            time.sleep(interval)
+            last_interval = interval
+            interval = min(interval * DIFF_SCAN_POLL_BACKOFF_MULTIPLIER, DIFF_SCAN_POLL_MAX_INTERVAL_SECONDS)
+
+        return DiffArtifacts.from_dict({
+            key: artifacts_dict.get(key) or []
+            for key in ("added", "removed", "unchanged", "replaced", "updated")
+        })
+
+    def _requires_unchanged_artifacts(self) -> bool:
+        """Whether any enabled output reads the unchanged half of a comparison.
+
+        A cached diff-scan response embeds every unchanged artifact at roughly 1 KB
+        each, so on a large dependency tree they are almost the entire payload
+        (~11 MB for a tree of ~10k unchanged packages) even though most runs never
+        look at them. Every consumer is behind an opt-in flag:
+
+        - ``--strict-blocking`` reads ``diff.unchanged_alerts`` to block on
+          pre-existing issues (socketcli, output, alert_selection, slack plugin).
+        - ``--enable-gitlab-security`` includes them in the GitLab dependency
+          scanning report (Messages.create_security_comment_gitlab).
+        - ``--generate-license`` enumerates ``diff.packages``, which must list every
+          dependency, not just the changed ones.
+        - ``--legal-format fossa`` reports all currently-present issues, matching
+          FOSSA's point-in-time snapshot semantics.
+
+        ``Diff.to_dict`` also serializes them but has no callers. When cli_config is
+        absent the caller is unknown, so the full payload is kept.
+
+        Keep this in sync with those consumers; test_unchanged_artifacts_gating
+        pins the list.
+        """
+        config = self.cli_config
+        if config is None:
+            return True
+        return bool(
+            getattr(config, "strict_blocking", False)
+            or getattr(config, "enable_gitlab_security", False)
+            or getattr(config, "generate_license", False)
+            or getattr(config, "legal_format", "socket") == "fossa"
+        )
+
     def get_added_and_removed_packages(
             self,
             head_full_scan_id: str,
-            new_full_scan_id: str
+            new_full_scan_id: str,
+            include_license_details: bool = False,
+            external_href: Optional[str] = None
     ) -> Tuple[Dict[str, Package], Dict[str, Package], Dict[str, Package]]:
         """
         Get packages that were added and removed between scans.
@@ -867,6 +2161,33 @@ class Core:
         Args:
             head_full_scan_id: Previous scan (maybe None if first scan)
             new_full_scan_id: New scan just created
+            include_license_details: Whether to ask the *legacy streaming* diff
+                endpoint to embed per-package license attribution/details in the
+                response. Only consulted on the fallback path: the primary
+                diff-scans path always receives embedded license details, since
+                the API ignores ``omit_license_details`` for cached reads (see
+                get_diff_scan_artifacts).
+
+                Defaults to ``False`` on purpose. The diff endpoint exists to
+                compare alerts between two scans; the license fields it can embed
+                are never consumed off the diff:
+                  * When ``--generate-license`` is OFF, the only consumer of
+                    ``Package.licenseDetails``/``licenseAttrib`` (the legal/FOSSA
+                    artifact builder) is never invoked, so the embedded license
+                    data is parsed and then dropped on the floor.
+                  * When ``--generate-license`` is ON, ``get_license_text_via_purl``
+                    re-fetches license data from the dedicated PURL endpoint and
+                    OVERWRITES whatever the diff embedded, before anything reads it.
+                Either way the embedded license payload is dead weight, and on
+                large dependency trees it inflated the diff response past ~2.3MB
+                and truncated it mid-string, crashing ``response.json()``.
+                Defaulting to ``False`` keeps the
+                diff lean with zero change to any output artifact. The parameter
+                is retained as an explicit override seam, not wired to the
+                ``--exclude-license-details`` user flag (which still governs the
+                human-facing dashboard report URL).
+            external_href: Optional pull request or merge request URL to associate
+                with the primary diff-scan resource
 
         Returns:
             Tuple of (added_packages, removed_packages) dictionaries
@@ -874,37 +2195,68 @@ class Core:
 
         log.info(f"Comparing scans - Head scan ID: {head_full_scan_id}, New scan ID: {new_full_scan_id}")
         diff_start = time.time()
+        diff_artifacts = None
         try:
-            diff_report = (
-                self.sdk.fullscans.stream_diff
-                           (
-                    self.config.org_slug,
-                    head_full_scan_id,
-                    new_full_scan_id,
-                    use_types=True
-                ).data
+            diff_artifacts = self.get_diff_scan_artifacts(
+                head_full_scan_id,
+                new_full_scan_id,
+                external_href=external_href,
             )
-        except APIFailure as e:
-            log.error(f"API Error: {e}")
-            sys.exit(1)
-        except Exception as e:
-            import traceback
-            log.error(f"Error getting diff report: {str(e)}")
-            log.error(f"Stack trace:\n{traceback.format_exc()}")
-            raise
+        except Exception as error:
+            # SDK error messages can span many lines (path + response headers); the
+            # first line carries the status, which is all the warning needs.
+            error_summary = str(error).strip().splitlines()[0] if str(error).strip() else ""
+            log.warning(
+                f"Diff scan comparison failed with {type(error).__name__}({error_summary}), "
+                "falling back to the streaming scan comparison"
+            )
+            log.info(
+                "Diff comparison mode: requested=diff-scan effective=streaming "
+                f"reason={type(error).__name__}"
+            )
+
+        if diff_artifacts is None:
+            try:
+                diff_artifacts = (
+                    self.sdk.fullscans.stream_diff(
+                        self.config.org_slug,
+                        head_full_scan_id,
+                        new_full_scan_id,
+                        use_types=True,
+                        include_license_details=str(include_license_details).lower()
+                    ).data.artifacts
+                )
+            except APIFailure as e:
+                log.error(f"API Error: {e}")
+                # API failures are mapped to the configured infrastructure exit code by cli().
+                raise
+            except Exception as e:
+                import traceback
+                log.error(f"Error getting diff report: {str(e)}")
+                log.error(f"Stack trace:\n{traceback.format_exc()}")
+                raise
 
         diff_end = time.time()
         log.info(f"Diff Report Gathered in {diff_end - diff_start:.2f} seconds")
-        log.info("Diff report artifact counts:")
-        log.info(f"Added: {len(diff_report.artifacts.added)}")
-        log.info(f"Removed: {len(diff_report.artifacts.removed)}")
-        log.info(f"Unchanged: {len(diff_report.artifacts.unchanged)}")
-        log.info(f"Replaced: {len(diff_report.artifacts.replaced)}")
-        log.info(f"Updated: {len(diff_report.artifacts.updated)}")
 
-        added_artifacts = diff_report.artifacts.added + diff_report.artifacts.updated
-        removed_artifacts = diff_report.artifacts.removed + diff_report.artifacts.replaced
-        unchanged_artifacts = diff_report.artifacts.unchanged
+        # Left in, the invalid-socket-facts marker reads as a newly added blocking package.
+        # Drop it from every bucket before the counts below, which should describe what the
+        # CLI actually reports on.
+        marker_found = False
+        buckets: Dict[str, List] = {}
+        for name in ("added", "removed", "unchanged", "replaced", "updated"):
+            bucket = getattr(diff_artifacts, name)
+            buckets[name] = [a for a in bucket if not Core.is_invalid_facts_marker(a)]
+            marker_found = marker_found or len(buckets[name]) != len(bucket)
+        Core.warn_if_invalid_facts_marker(marker_found)
+
+        log.info("Diff report artifact counts:")
+        for name, bucket in buckets.items():
+            log.info(f"{name.capitalize()}: {len(bucket)}")
+
+        added_artifacts = buckets["added"] + buckets["updated"]
+        removed_artifacts = buckets["removed"] + buckets["replaced"]
+        unchanged_artifacts = buckets["unchanged"]
 
         added_packages: Dict[str, Package] = {}
         removed_packages: Dict[str, Package] = {}
@@ -938,8 +2290,6 @@ class Core:
             try:
                 pkg = Package.from_diff_artifact(asdict(artifact))
                 pkg = Core.update_package_values(pkg)
-                if pkg.namespace:
-                    pkg.purl += f"{pkg.namespace}/{pkg.purl}"
                 removed_packages[artifact.id] = pkg
             except KeyError:
                 log.error(f"KeyError: Could not create package from removed artifact {artifact.id}")
@@ -964,7 +2314,8 @@ class Core:
             save_files_list_path: Optional[str] = None,
             save_manifest_tar_path: Optional[str] = None,
             base_paths: Optional[List[str]] = None,
-            explicit_files: Optional[List[str]] = None
+            explicit_files: Optional[List[str]] = None,
+            external_href: Optional[str] = None
     ) -> Diff:
         """Create a new diff using the Socket SDK.
 
@@ -976,6 +2327,8 @@ class Core:
             save_manifest_tar_path: Optional path to save manifest files tar.gz archive
             base_paths: List of base paths for the scan (optional)
             explicit_files: Optional list of explicit files to use instead of discovering files
+            external_href: Optional pull request or merge request URL to associate
+                with the diff scan
         """
         log.debug(f"starting create_new_diff with no_change: {no_change}")
         if no_change:
@@ -990,6 +2343,14 @@ class Core:
             for path in paths:
                 files = self.find_files(path)
                 all_files.extend(files)
+
+        self._log_scan_configuration(
+            paths,
+            params,
+            all_files,
+            manifest_source="provided" if explicit_files is not None else "discovered",
+            base_paths=base_paths,
+        )
         
         # Save submitted files list if requested
         if save_files_list_path and all_files:
@@ -1005,11 +2366,9 @@ class Core:
             log.info("No supported manifest files found - creating empty scan for diff comparison")
             scan_files = Core.empty_head_scan_file()
 
-        try:
-            # Get head scan ID
-            head_full_scan_id = self.get_head_scan_for_repo(params.repo)
-        except APIResourceNotFound:
-            head_full_scan_id = None
+        # Resolve the baseline scan: --base-scan-id / --base-commit-sha override
+        # the repository's head scan (None only when the repo has no head scan yet).
+        head_full_scan_id = self.resolve_base_full_scan_id(params)
 
         # If no head scan exists, create an empty baseline scan
         if head_full_scan_id is None:
@@ -1027,7 +2386,10 @@ class Core:
             try:
                 head_full_scan = self.create_full_scan(empty_files, tmp_params, base_paths=base_paths)
                 head_full_scan_id = head_full_scan.id
-                log.debug(f"Created empty baseline scan: {head_full_scan_id}")
+                log.info(
+                    "Baseline selected: source=empty "
+                    f"scan_id={json.dumps(head_full_scan_id)}"
+                )
                 
                 # Clean up the temporary empty file
                 for temp_file in empty_files:
@@ -1063,7 +2425,8 @@ class Core:
                     os.unlink(temp_file)
                 except OSError:
                     pass
-            sys.exit(1)
+            # API failures are mapped to the configured infrastructure exit code by cli().
+            raise
         except Exception as e:
             import traceback
             log.error(f"Error creating new full scan: {str(e)}")
@@ -1084,12 +2447,25 @@ class Core:
                 except OSError as e:
                     log.warning(f"Failed to clean up temporary file {temp_file}: {e}")
 
-        # Handle diff generation - now we always have both scans
+        # Handle diff generation - now we always have both scans.
+        #
+        # Note: we intentionally do NOT forward params.include_license_details
+        # (the --exclude-license-details user flag) into the diff request. The
+        # diff path never consumes embedded license data (see
+        # get_added_and_removed_packages docstring), so requesting it only bloats
+        # the response and risks the truncation crash on large repos. The
+        # user flag still controls the dashboard report URL below; it just no
+        # longer gates this internal diff payload.
         (
             added_packages,
             removed_packages,
             packages
-        ) = self.get_added_and_removed_packages(head_full_scan_id, new_full_scan.id)
+        ) = self.get_added_and_removed_packages(
+            head_full_scan_id,
+            new_full_scan.id,
+            include_license_details=False,
+            external_href=external_href,
+        )
 
         # Separate unchanged packages from added/removed for --strict-blocking support
         unchanged_packages = {
@@ -1113,6 +2489,10 @@ class Core:
             diff.diff_url = f"{base_socket}/{self.config.org_slug}/diff/{head_full_scan_id}/{diff.id}"
         else:
             diff.diff_url = diff.report_url
+
+        # PR/MR runs previously logged only the scan IDs, so a CI log had no link to the
+        # result. Logged here rather than at each call site so every diff flow gets it.
+        log.info(f"Diff report URL: {diff.diff_url}")
 
         return diff
 
@@ -1148,16 +2528,22 @@ class Core:
         alerts_in_removed_packages: Dict[str, List[Issue]] = {}
         alerts_in_unchanged_packages: Dict[str, List[Issue]] = {}
 
-        seen_new_packages = set()
-        seen_removed_packages = set()
+        seen_packages = {
+            "added": set(),
+            "updated": set(),
+            "removed": set(),
+            "replaced": set(),
+        }
 
         for package_id, package in added_packages.items():
             purl = self.create_purl(package_id, added_packages)
             base_purl = f"{purl.ecosystem}/{purl.name}@{purl.version}"
 
-            if (not direct_only or package.direct) and base_purl not in seen_new_packages:
-                diff.new_packages.append(purl)
-                seen_new_packages.add(base_purl)
+            change_type = "updated" if package.diffType == "updated" else "added"
+            target = diff.updated_packages if change_type == "updated" else diff.new_packages
+            if (not direct_only or package.direct) and base_purl not in seen_packages[change_type]:
+                target.append(purl)
+                seen_packages[change_type].add(base_purl)
 
             self.add_package_alerts_to_collection(
                 package=package,
@@ -1169,9 +2555,11 @@ class Core:
             purl = self.create_purl(package_id, removed_packages)
             base_purl = f"{purl.ecosystem}/{purl.name}@{purl.version}"
 
-            if (not direct_only or package.direct) and base_purl not in seen_removed_packages:
-                diff.removed_packages.append(purl)
-                seen_removed_packages.add(base_purl)
+            change_type = "replaced" if package.diffType == "replaced" else "removed"
+            target = diff.replaced_packages if change_type == "replaced" else diff.removed_packages
+            if (not direct_only or package.direct) and base_purl not in seen_packages[change_type]:
+                target.append(purl)
+                seen_packages[change_type].add(base_purl)
 
             self.add_package_alerts_to_collection(
                 package=package,
@@ -1296,23 +2684,24 @@ class Core:
     @staticmethod
     def add_purl_capabilities(diff: Diff) -> None:
         """
-        Adds capability information to each package in the diff's new_packages list.
+        Adds capability information to the diff's added and updated packages.
+
+        Both lists are walked because an updated package is still newly present at
+        its new version, so its capabilities are as relevant as an added one's.
 
         Args:
             diff: Diff object to update with capability information
         """
-        new_packages = []
-        for purl in diff.new_packages:
-            if purl.id in diff.new_capabilities:
-                new_purl = Purl(
-                    **{**purl.__dict__,
-                    "capabilities": diff.new_capabilities[purl.id]}
-                )
-                new_packages.append(new_purl)
-            else:
-                new_packages.append(purl)
-
-        diff.new_packages = new_packages
+        for attribute in ("new_packages", "updated_packages"):
+            packages = []
+            for purl in getattr(diff, attribute):
+                if purl.id in diff.new_capabilities:
+                    purl = Purl(
+                        **{**purl.__dict__,
+                        "capabilities": diff.new_capabilities[purl.id]}
+                    )
+                packages.append(purl)
+            setattr(diff, attribute, packages)
 
     def add_package_alerts_to_collection(self, package: Package, alerts_collection: dict, packages: dict) -> dict:
         """
@@ -1337,11 +2726,19 @@ class Core:
             alert = Alert(**alert_item)
             props = getattr(self.config.all_issues, alert.type, default_props)
             introduced_by = self.get_source_data(package, packages)
-            
-            # Handle special case for license policy violations
+
+            # Title resolution order:
+            #   1. SDK-provided title (props.title) if non-empty
+            #   2. Explicit override for known-but-unmapped alert types (e.g. gptDidYouMean)
+            #   3. Hard-coded special cases (e.g. licenseSpdxDisj)
+            #   4. Humanized alert.type as last-resort fallback
             title = props.title
-            if alert.type == "licenseSpdxDisj" and not title:
+            if not title:
+                title = _ALERT_TYPE_TITLE_OVERRIDES.get(alert.type, "")
+            if not title and alert.type == "licenseSpdxDisj":
                 title = "License Policy Violation"
+            if not title:
+                title = _humanize_alert_type(alert.type)
             
             issue_alert = Issue(
                 pkg_type=package.type,
@@ -1357,6 +2754,8 @@ class Core:
                 suggestion=props.suggestion,
                 next_step_title=props.nextStepTitle,
                 introduced_by=introduced_by,
+                manifest_files=package.manifestFiles or [],
+                direct=bool(package.direct),
                 purl=package.purl,
                 url=package.url
             )

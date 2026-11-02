@@ -1,0 +1,184 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    # Skip e2e on:
+    #  - PRs from forks (no secrets)
+    #  - Dependabot PRs (no secrets, and dependency-bump risk is already
+    #    covered by dependency-review.yml's Socket Firewall smoke jobs)
+    if: >-
+      (github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository) &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: scan
+            args: >-
+              --target-path tests/e2e/fixtures/simple-npm
+              --disable-blocking
+              --enable-debug
+            validate: tests/e2e/validate-scan.sh
+
+          - name: sarif
+            args: >-
+              --target-path tests/e2e/fixtures/simple-npm
+              --sarif-file /tmp/results.sarif
+              --disable-blocking
+            validate: tests/e2e/validate-sarif.sh
+
+          - name: reachability
+            args: >-
+              --target-path tests/e2e/fixtures/simple-npm
+              --reach
+              --disable-blocking
+              --enable-debug
+            validate: tests/e2e/validate-reachability.sh
+            setup-node: "true"
+            # The tier-1 reachability backend intermittently returns empty
+            # results while the CLI reports success. The probe exits 0 when
+            # the facts file has alerted components; anything else is
+            # retried before validation fails the job.
+            retry-probe: bash tests/e2e/reach-facts-probe.sh tests/e2e/fixtures/simple-npm
+
+          - name: gitlab
+            args: >-
+              --target-path tests/e2e/fixtures/simple-npm
+              --enable-gitlab-security
+              --disable-blocking
+            validate: tests/e2e/validate-gitlab.sh
+
+          - name: json
+            args: >-
+              --target-path tests/e2e/fixtures/simple-npm
+              --enable-json
+              --disable-blocking
+            validate: tests/e2e/validate-json.sh
+
+          - name: pypi
+            args: >-
+              --target-path tests/e2e/fixtures/simple-pypi
+              --disable-blocking
+              --enable-debug
+            validate: tests/e2e/validate-scan.sh
+
+    name: e2e-${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: matrix.setup-node == 'true'
+        with:
+          node-version: '22'
+
+      - name: Install CLI from local repo
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Install uv
+        if: matrix.setup-node == 'true'
+        run: pip install uv
+
+      - name: Run Socket CLI
+        id: run-cli
+        env:
+          SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_CLI_API_TOKEN }}
+          RETRY_PROBE: ${{ matrix.retry-probe }}
+        run: |
+          set -o pipefail
+          # Entries with retry-probe get up to 3 attempts: the probe exits 0
+          # when the scan output looks complete, and a run that fails it is
+          # re-run on the assumption of a transient backend failure. A
+          # persistent incomplete result still reaches validation. Validation
+          # only treats the explicit zero-project backend signature as
+          # inconclusive; any other empty result remains a failure. Retries are
+          # surfaced as warning annotations so flake frequency stays visible.
+          max_attempts=3
+          attempt=1
+          while :; do
+            socketcli ${{ matrix.args }} 2>&1 | tee /tmp/e2e-output.log
+            [ -z "$RETRY_PROBE" ] && break
+            if bash -c "$RETRY_PROBE"; then
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::warning title=e2e-${{ matrix.name }} incomplete results::output still fails the completeness probe after ${max_attempts} attempts; letting validation classify the result"
+              echo "diagnostics=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            echo "::warning title=e2e-${{ matrix.name }} transient retry::attempt ${attempt} failed the completeness probe (suspected backend transient); retrying"
+            echo "e2e-${{ matrix.name }}: retry after attempt ${attempt} — completeness probe failed (suspected transient)" >> "$GITHUB_STEP_SUMMARY"
+            attempt=$((attempt+1))
+            sleep 30
+          done
+
+      - name: Validate results
+        env:
+          SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_CLI_API_TOKEN }}
+        run: bash ${{ matrix.validate }}
+
+      - name: Upload diagnostics on failure
+        if: failure() || steps.run-cli.outputs.diagnostics == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-${{ matrix.name }}-diagnostics-attempt${{ github.run_attempt }}
+          path: |
+            /tmp/e2e-output.log
+            /tmp/*.sarif
+            tests/e2e/fixtures/simple-npm/.socket.facts.json
+            tests/e2e/fixtures/simple-pypi/.socket.facts.json
+            gl-*.json
+            license_output.json
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 14
+
+  # Branch protection requires the e2e-* checks, but the `e2e` job above is
+  # skipped on PRs that can't access repository secrets -- fork PRs and
+  # Dependabot PRs. A job skipped via a job-level `if` never expands its
+  # matrix, so the e2e-* check contexts are never created and the required
+  # checks sit at "Expected -- Waiting for status to be reported" forever,
+  # permanently blocking merge.
+  #
+  # This bypass reports a green status under the SAME e2e-* check names for
+  # exactly those PRs, satisfying branch protection without running the real
+  # tests (which need SOCKET_CLI_API_TOKEN). Its `if` is the precise negation
+  # of the e2e job's run condition, so the two are mutually exclusive: any
+  # given PR runs one or the other, never both, and never neither.
+  #
+  # Dependency-bump risk on these PRs is still covered by dependency-review.yml's
+  # Socket Firewall smoke jobs, which run without repository secrets.
+  e2e-bypass:
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.pull_request.head.repo.full_name != github.repository ||
+        github.event.pull_request.user.login == 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        name: [scan, sarif, reachability, gitlab, json, pypi]
+    name: e2e-${{ matrix.name }}
+    steps:
+      - name: Report skip status
+        run: |
+          echo "Skipping e2e-${{ matrix.name }} for a PR without repository secrets"
+          echo "(fork or Dependabot). Dependency risk is covered by dependency-review.yml."

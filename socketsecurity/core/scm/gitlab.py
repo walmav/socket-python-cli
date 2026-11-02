@@ -1,9 +1,12 @@
+import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional
 
 import requests
+from socketdev.exceptions import APIFailure
+
 from socketsecurity import USER_AGENT
 from socketsecurity.core import log
 from socketsecurity.core.classes import Comment
@@ -47,8 +50,15 @@ class GitlabConfig:
         # Determine which authentication pattern to use
         headers = cls._get_auth_headers(token)
 
+        # Prefer source branch SHA (real commit) over CI_COMMIT_SHA which
+        # may be a synthetic merge-result commit in merged-results pipelines.
+        commit_sha = (
+            os.getenv('CI_MERGE_REQUEST_SOURCE_BRANCH_SHA') or
+            os.getenv('CI_COMMIT_SHA', '')
+        )
+
         return cls(
-            commit_sha=os.getenv('CI_COMMIT_SHA', ''),
+            commit_sha=commit_sha,
             api_url=os.getenv('CI_API_V4_URL', ''),
             project_dir=os.getenv('CI_PROJECT_DIR', ''),
             mr_source_branch=mr_source_branch,
@@ -117,37 +127,54 @@ class GitlabConfig:
         }
 
 class Gitlab:
-    def __init__(self, client: CliClient, config: Optional[GitlabConfig] = None):
+    # GitLab access levels: 30 Developer, 40 Maintainer, 50 Owner. Reporter (20)
+    # and Guest (10) cannot push, so they cannot suppress an alert either.
+    MIN_IGNORE_ACCESS_LEVEL = 30
+    # Bounded so a project with a very large membership cannot stall a scan. Past
+    # the cap the answer is "undetermined", handled the same as a failed lookup.
+    MEMBER_PAGE_SIZE = 100
+    MEMBER_PAGE_LIMIT = 10
+
+    def __init__(
+        self,
+        client: CliClient,
+        config: Optional[GitlabConfig] = None,
+        ignore_authorization: str = "enforce",
+    ):
         self.config = config or GitlabConfig.from_env()
         self.client = client
+        self.ignore_authorization = ignore_authorization
+        # None until the first ignore comment forces a lookup; stays None when the
+        # members API cannot be read, which is the "undetermined" state.
+        self._member_access: Optional[dict] = None
+        self._member_lookup_attempted = False
 
     def _request_with_fallback(self, **kwargs):
-        """
-        Make a request with automatic fallback between Bearer and PRIVATE-TOKEN authentication.
-        This provides robustness when the initial token type detection is incorrect.
+        """Request with one retry under the other GitLab auth scheme on a 401.
+
+        _get_auth_headers guesses between Bearer and PRIVATE-TOKEN from the shape of
+        the token, and the guess can be wrong for tokens that do not match a known
+        pattern. Rather than fail the run, try the other scheme once.
+
+        Catches APIFailure, not requests.exceptions.HTTPError: CliClient translates
+        every requests error into APIFailure, which does not inherit from HTTPError,
+        so catching the latter here never fired and the fallback never ran.
         """
         try:
-            # Try the initial request with the configured headers
             return self.client.request(**kwargs)
-        except requests.exceptions.HTTPError as e:
-            # Check if this is an authentication error (401)
-            if e.response and e.response.status_code == 401:
-                log.debug(f"Authentication failed with initial headers, trying fallback method")
-                
-                # Determine the fallback headers
-                original_headers = kwargs.get('headers', self.config.headers)
-                fallback_headers = self._get_fallback_headers(original_headers)
-                
-                if fallback_headers and fallback_headers != original_headers:
-                    log.debug("Retrying request with fallback authentication method")
-                    kwargs['headers'] = fallback_headers
-                    return self.client.request(**kwargs)
-            
-            # Re-raise the original exception if it's not an auth error or fallback failed
-            raise
-        except Exception as e:
-            # Handle other types of exceptions that don't have response attribute
-            raise
+        except APIFailure as error:
+            if error.status_code != 401:
+                raise
+
+            log.debug("Authentication failed with initial headers, trying fallback method")
+            original_headers = kwargs.get('headers', self.config.headers)
+            fallback_headers = self._get_fallback_headers(original_headers)
+            if not fallback_headers or fallback_headers == original_headers:
+                raise
+
+            log.debug("Retrying request with fallback authentication method")
+            kwargs['headers'] = fallback_headers
+            return self.client.request(**kwargs)
 
     def _get_fallback_headers(self, original_headers: dict) -> dict:
         """
@@ -212,6 +239,24 @@ class Gitlab:
             base_url=self.config.api_url
         )
 
+    def has_thumbsup_reaction(self, comment_id: int) -> bool:
+        """Best-effort check for 'thumbsup' award emoji on a MR note."""
+        if not self.config.mr_project_id or not self.config.mr_iid:
+            return False
+        path = f"projects/{self.config.mr_project_id}/merge_requests/{self.config.mr_iid}/notes/{comment_id}/award_emoji"
+        try:
+            response = self._request_with_fallback(
+                path=path,
+                headers=self.config.headers,
+                base_url=self.config.api_url
+            )
+            for emoji in response.json():
+                if emoji.get("name") == "thumbsup":
+                    return True
+        except Exception as e:
+            log.debug(f"Could not check award emoji for note {comment_id} (best effort): {e}")
+        return False
+
     def get_comments_for_pr(self) -> dict:
         log.debug(f"Getting Gitlab comments for Repo {self.config.repository} for PR {self.config.mr_iid}")
         path = f"projects/{self.config.mr_project_id}/merge_requests/{self.config.mr_iid}/notes"
@@ -229,7 +274,88 @@ class Gitlab:
                 comment.body_list = comment.body.split("\n")
         else:
             log.error(raw_comments)
-        return Comments.check_for_socket_comments(comments)
+        gate = None if self.ignore_authorization == "off" else self.is_ignore_authorized
+        return Comments.check_for_socket_comments(comments, gate)
+
+    def _load_member_access(self) -> Optional[dict]:
+        """Map project member user id -> access level, or None if unreadable.
+
+        ``members/all`` is used rather than a per-user lookup because it answers
+        non-membership with a 200 and an absent id. CliClient collapses every HTTP
+        error into APIFailure without a status code, so a per-user 404 -- exactly
+        the outsider case this guards against -- would be indistinguishable from a
+        token that cannot read the endpoint, and would have to fail open.
+        """
+        if self._member_lookup_attempted:
+            return self._member_access
+        self._member_lookup_attempted = True
+        if not self.config.mr_project_id:
+            return None
+
+        access: dict = {}
+        for page in range(1, Gitlab.MEMBER_PAGE_LIMIT + 1):
+            path = (
+                f"projects/{self.config.mr_project_id}/members/all"
+                f"?per_page={Gitlab.MEMBER_PAGE_SIZE}&page={page}"
+            )
+            try:
+                response = self._request_with_fallback(
+                    path=path,
+                    headers=self.config.headers,
+                    base_url=self.config.api_url
+                )
+                members = response.json()
+            except Exception as error:
+                log.warning(f"Could not read GitLab project members: {error}")
+                return None
+            if not isinstance(members, list):
+                log.warning("Unexpected GitLab project members response")
+                return None
+            for member in members:
+                if isinstance(member, dict) and member.get("id") is not None:
+                    access[member["id"]] = member.get("access_level") or 0
+            if len(members) < Gitlab.MEMBER_PAGE_SIZE:
+                self._member_access = access
+                return access
+
+        log.warning(
+            f"GitLab project has more than {Gitlab.MEMBER_PAGE_SIZE * Gitlab.MEMBER_PAGE_LIMIT} "
+            "members; cannot confirm ignore-command authorization"
+        )
+        return None
+
+    def is_ignore_authorized(self, comment: Comment) -> bool:
+        """Whether a commenter may suppress alerts with @SocketSecurity ignore.
+
+        GitLab notes carry no permission field, so this costs one members lookup
+        per run (cached, and only when an ignore command is actually present).
+
+        When membership can be read the answer is definitive. When it cannot -- a
+        CI_JOB_TOKEN generally cannot read the members API -- the command is
+        honored and a warning is logged, preserving compatibility for pipelines
+        that rely on ignore commands. Set a token with API read access to get
+        enforcement.
+        """
+        access = self._load_member_access()
+        if access is None:
+            author = Comments.comment_author_name(comment)
+            if self.ignore_authorization == "strict":
+                log.warning(
+                    f"Rejecting @SocketSecurity ignore from {author}: GitLab project "
+                    "membership could not be read and --ignore-authorization is strict."
+                )
+                return False
+            log.warning(
+                f"Honoring @SocketSecurity ignore from {author} without verifying "
+                "write access: GitLab project membership could not be read. Use a "
+                "token with API read access, or --ignore-authorization strict to "
+                "reject instead."
+            )
+            return True
+
+        author = getattr(comment, "author", None) or {}
+        user_id = author.get("id")
+        return access.get(user_id, 0) >= Gitlab.MIN_IGNORE_ACCESS_LEVEL
 
     def add_socket_comments(
             self,
@@ -260,9 +386,91 @@ class Gitlab:
                 log.debug("No Previous version of Security Issue comment, posting")
                 self.post_comment(security_comment)
 
+    def enable_merge_pipeline_check(self) -> None:
+        """Enable 'only_allow_merge_if_pipeline_succeeds' on the MR target project."""
+        if not self.config.mr_project_id:
+            return
+        url = f"{self.config.api_url}/projects/{self.config.mr_project_id}"
+        try:
+            resp = requests.put(
+                url,
+                json={"only_allow_merge_if_pipeline_succeeds": True},
+                headers=self.config.headers,
+            )
+            if resp.status_code == 401:
+                fallback = self._get_fallback_headers(self.config.headers)
+                if fallback:
+                    resp = requests.put(
+                        url,
+                        json={"only_allow_merge_if_pipeline_succeeds": True},
+                        headers=fallback,
+                    )
+            if resp.status_code >= 400:
+                log.error(f"GitLab enable merge check API {resp.status_code}: {resp.text}")
+            else:
+                log.info("Enabled 'pipelines must succeed' merge check on project")
+        except Exception as e:
+            log.error(f"Failed to enable merge pipeline check: {e}")
+
+    def set_commit_status(self, state: str, description: str, target_url: str = '') -> None:
+        """Post a commit status to GitLab. state should be 'success' or 'failed'.
+
+        Uses requests.post with json= directly because CliClient.request sends
+        data= (form-encoded) which GitLab's commit status endpoint rejects.
+        """
+        if not self.config.mr_project_id:
+            log.debug("No mr_project_id, skipping commit status")
+            return
+        url = f"{self.config.api_url}/projects/{self.config.mr_project_id}/statuses/{self.config.commit_sha}"
+        payload = {
+            "state": state,
+            "context": "socket-security-commit-status",
+            "description": description,
+        }
+        if self.config.mr_source_branch:
+            payload["ref"] = self.config.mr_source_branch
+        if target_url:
+            payload["target_url"] = target_url
+        try:
+            log.debug(f"Posting commit status to {url}")
+            resp = requests.post(url, json=payload, headers=self.config.headers)
+            if resp.status_code == 401:
+                fallback = self._get_fallback_headers(self.config.headers)
+                if fallback:
+                    resp = requests.post(url, json=payload, headers=fallback)
+            if resp.status_code >= 400:
+                log.error(f"GitLab commit status API {resp.status_code}: {resp.text}")
+            resp.raise_for_status()
+            log.info(f"Commit status set to '{state}' on {self.config.commit_sha[:8]}")
+        except Exception as e:
+            log.error(f"Failed to set commit status: {e}")
+
+    def post_thumbsup_reaction(self, comment_id: int) -> None:
+        """Best-effort: add 'thumbsup' award emoji to a MR note."""
+        if not self.config.mr_project_id or not self.config.mr_iid:
+            return
+        path = f"projects/{self.config.mr_project_id}/merge_requests/{self.config.mr_iid}/notes/{comment_id}/award_emoji"
+        try:
+            headers = {**self.config.headers, "Content-Type": "application/json"}
+            self._request_with_fallback(
+                path=path,
+                payload=json.dumps({"name": "thumbsup"}),
+                method="POST",
+                headers=headers,
+                base_url=self.config.api_url
+            )
+        except Exception as e:
+            log.debug(f"Could not add thumbsup emoji to note {comment_id} (best effort): {e}")
+
+    def handle_ignore_reactions(self, comments: dict) -> None:
+        for comment in comments.get("ignore", []):
+            if "SocketSecurity ignore" in comment.body and not self.has_thumbsup_reaction(comment.id):
+                self.post_thumbsup_reaction(comment.id)
+
     def remove_comment_alerts(self, comments: dict):
         security_alert = comments.get("security")
         if security_alert is not None:
             # Type narrowing: after None check, mypy knows this is Comment
             new_body = Comments.process_security_comment(security_alert, comments)
+            self.handle_ignore_reactions(comments)
             self.update_comment(new_body, str(security_alert.id))
